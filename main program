@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Two-Level NSGA-II for Multi-batch Multimodal Transportation
-- Upper level: NSGA-II to build an OD→route pool (batch-agnostic)
-- Lower level: batch allocation + feasibility checks (capacity/timetables/time windows) with bottleneck feedback
-- Objectives: cost / emissions / completion time
-- Data: reads from extended.xlsx; if sea legs/feeders are missing, common trunks are auto-injected
-- Output: optimisation_results.txt (Pareto overview + detailed allocation + full route decomposition)
+Two-Level NSGA-II for Multi-batch Multimodal Transport (UK English style)
+- Upper level: NSGA-II chooses an OD → path portfolio (batch-agnostic)
+- Lower level: greedy batch allocation with feasibility checks (capacity/timetable/timing)
+- Objectives: total cost / total emissions / makespan
+- Data: reads from extended.xlsx; if maritime/feeder legs are missing, common backbones are injected
+- Output: optimisation summary to terminal + full report to optimisation_results.txt (incl. per-batch total time)
 """
 
 import os
@@ -18,22 +18,19 @@ from enum import IntEnum
 import random
 import copy
 from collections import defaultdict, deque
-import math
 import re
 
-# =========================
-# Routing/policy hyperparameters (bias towards sea)
-# =========================
-ROAD_MAX_KM   = 350.0   # Max single road leg distance in kilometres (>350 km not considered; road used as short drayage)
-PUNISH_ROAD   = 80.0    # Penalty per road leg
-REWARD_RAIL   = 10.0    # Reward per rail leg
-REWARD_WATER  = 40.0    # Reward per water leg
+# ---------- path/mode biases (encourage maritime/rail, discourage long road) ----------
+ROAD_MAX_KM  = 350.0    # max single road leg distance; above this road legs are disallowed in path search
+PUNISH_ROAD  = 80.0
+REWARD_RAIL  = 10.0
+REWARD_WATER = 40.0
 
-# Ports & extra handling times (hours)
-PORT_HANDLING_H        = 36.0   # Per port call (load/unload on one side)
-RAIL_BORDER_GAUGE_H    = 12.0   # Break-of-gauge handling (e.g., Brest/Malaszewicze)
+# generic handling time add-ons (hours)
+PORT_HANDLING_H     = 36.0  # per port-side (load/unload combined as one side)
+RAIL_BORDER_GAUGE_H = 12.0  # gauge change at rail borders
 
-# Port whitelists (used if Excel lacks explicit port flags)
+# common ports (used if Excel has no explicit port flags)
 SEA_PORTS_CN = {
     "Shanghai","Ningbo","Qingdao","Tianjin","Dalian","Xiamen",
     "Shenzhen","Guangzhou","Lianyungang","Yantian","Shekou","Nansha"
@@ -43,19 +40,15 @@ SEA_PORTS_EU = {
     "Gdansk","Gdynia","Koper","Piraeus","Gioia Tauro","Gothenburg","Felixstowe"
 }
 
-# =========================
-# Model symbols (aligned with Table II)
-# =========================
+# ---------- notation (aligned with the paper) ----------
 
 class Mode(IntEnum):
-    """Transport modes M = {1: road, 2: rail, 3: waterway}"""
     ROAD = 1
     RAIL = 2
     WATER = 3
 
 @dataclass
 class NetworkParameters:
-    """Parameters matching Table II notation"""
     L_ij: Dict[Tuple[str, str], float] = field(default_factory=dict)
     CAP_node: Dict[str, float] = field(default_factory=dict)       # TEU/h
     CAP_border: Dict[str, float] = field(default_factory=dict)
@@ -76,12 +69,11 @@ class NetworkParameters:
     TT_jmn: Dict[Tuple[str, Mode, Mode], float] = field(default_factory=dict)
     BD_j: Dict[str, float] = field(default_factory=dict)
     CC_j: Dict[str, float] = field(default_factory=dict)
-    S_jm: Dict[Tuple[str, Mode], List[float]] = field(default_factory=dict)   # Weekly departure times (hours, 0–168)
+    S_jm: Dict[Tuple[str, Mode], List[float]] = field(default_factory=dict)   # departures in [0,168)
     arc_modes: Dict[Tuple[str, str], List[Mode]] = field(default_factory=dict)
 
 @dataclass
 class Batch:
-    """Batch k ∈ K with parameters from Table II"""
     id: int
     O_k: str
     DEST_k: str
@@ -91,13 +83,11 @@ class Batch:
 
 @dataclass
 class DecisionVariables:
-    """Primary decision variables from Table II"""
     f_ijmk: Dict[Tuple[str, str, Mode, int], float] = field(default_factory=dict)
     z_ijmk: Dict[Tuple[str, str, Mode, int], float] = field(default_factory=dict)
 
 @dataclass
 class AuxiliaryVariables:
-    """Auxiliary variables from Table II"""
     y_jmnk: Dict[Tuple[str, Mode, Mode, int], float] = field(default_factory=dict)
     t_max: float = 0.0
     a_jk: Dict[Tuple[str, int], float] = field(default_factory=dict)  # arrival time at node j
@@ -107,10 +97,9 @@ class AuxiliaryVariables:
     p_jk: Dict[Tuple[str, int], float] = field(default_factory=dict)
     delta_k: Dict[int, float] = field(default_factory=dict)
 
-# ===== Original model: objective evaluation =====
+# ---------- core model (objective evaluation) ----------
 
 class MultimodalOptimizationModel:
-    """Implementation of the mathematical model"""
     def __init__(self, params: NetworkParameters, network: dict, batches: List[Batch]):
         self.params = params
         self.network = network
@@ -119,7 +108,6 @@ class MultimodalOptimizationModel:
         self.arcs = network['arcs']
 
     def determine_transshipment_volumes(self, decision_vars: DecisionVariables) -> Dict:
-        """Derive y_jmnk (transhipment volumes) from flow variables"""
         y_jmnk = {}
         for batch in self.batches:
             k = batch.id
@@ -148,7 +136,6 @@ class MultimodalOptimizationModel:
         return y_jmnk
 
     def calculate_objective_1(self, decision_vars: DecisionVariables, aux_vars: AuxiliaryVariables) -> float:
-        """Minimise total cost"""
         total_cost = 0.0
         for batch in self.batches:
             k = batch.id
@@ -210,7 +197,6 @@ class MultimodalOptimizationModel:
         return total_cost
 
     def calculate_objective_2(self, decision_vars: DecisionVariables) -> float:
-        """Minimise total carbon emissions"""
         total_emissions = 0.0
         for batch in self.batches:
             k = batch.id
@@ -225,21 +211,17 @@ class MultimodalOptimizationModel:
         return total_emissions
 
     def calculate_objective_3(self, aux_vars: AuxiliaryVariables) -> float:
-        """Minimise completion time"""
         return aux_vars.t_max
 
-# =========================
-# Two-level framework data structures
-# =========================
+# ---------- two-level framework data structures ----------
 
 @dataclass
 class RouteSegment:
-    nodes: List[str]       # e.g. [Xi'an, Khorgos, ... , Berlin]
-    modes: List[Mode]      # len = len(nodes)-1
+    nodes: List[str]
+    modes: List[Mode]
 
 @dataclass
 class PortfolioChromosome:
-    """Upper-level chromosome: a small route pool per (O,D) (batch-agnostic)"""
     route_pool: Dict[Tuple[str, str], List[RouteSegment]] = field(default_factory=dict)
 
 @dataclass
@@ -251,22 +233,20 @@ class AllocationResult:
     bottleneck_nodes: List[str] = field(default_factory=list)
     late_batches: List[int] = field(default_factory=list)
 
-# =========================
-# Lower-level allocation & feasibility
-# =========================
+# ---------- lower level allocator (greedy, light timing) ----------
 
 class LowerLevelAllocator:
     def __init__(self, model: MultimodalOptimizationModel, plan_horizon_h: float = 168.0):
         self.model = model
         self.params = model.params
         self.network = model.network
-        self.plan_horizon_h = plan_horizon_h  # Approximate rolling window (hours)
+        self.plan_horizon_h = plan_horizon_h  # hours
 
     def evaluate(self, chrom: PortfolioChromosome) -> AllocationResult:
         dv = DecisionVariables()
         aux = AuxiliaryVariables()
 
-        # Batch priority: tighter due dates (small LT) and larger volumes first
+        # priority: tighter LT first, then larger batch
         batches_sorted = sorted(
             self.model.batches,
             key=lambda b: (b.LT_k - b.ET_k, -b.Q_k)
@@ -283,7 +263,6 @@ class LowerLevelAllocator:
                 bottlenecks.add(b.O_k)
                 continue
 
-            # Route scoring: penalise road, reward rail/sea
             def score_route(r: RouteSegment) -> float:
                 length = self._route_distance(r)
                 road_legs  = sum(1 for m in r.modes if m == Mode.ROAD)
@@ -294,7 +273,7 @@ class LowerLevelAllocator:
 
             routes_sorted = sorted(cand_routes, key=score_route)
 
-            parts = []  # (route, flow)
+            parts = []
             remaining = b.Q_k
 
             for route in routes_sorted:
@@ -312,11 +291,10 @@ class LowerLevelAllocator:
                     else:
                         bottlenecks.update(viol_nodes)
                     continue
-                # Timetable presence (soft warning only)
+                # timetable presence hint (does not block)
                 sched_missing = self._check_timetable_presence(route)
                 if sched_missing:
                     bottlenecks.update(sched_missing)
-                # Allocate full remainder
                 use = min(remaining, b.Q_k)
                 parts.append((route, use))
                 self._accumulate_node_load(route, use, node_load)
@@ -327,7 +305,6 @@ class LowerLevelAllocator:
                     bottlenecks.add(n)
                 continue
 
-            # Convert to decision variables
             for route, flow in parts:
                 self._inject_route_flow_to_dv(b.id, route, flow, dv)
 
@@ -340,11 +317,10 @@ class LowerLevelAllocator:
                 late_batches=[]
             )
 
-        # Timing & objectives
         aux.y_jmnk = self.model.determine_transshipment_volumes(dv)
         self._calculate_temporal_variables_light(dv, aux)
 
-        # Mark late batches
+        # mark late batches
         for b in self.model.batches:
             arrive = 0.0
             for (j_k, k), t in aux.a_jk.items():
@@ -380,11 +356,6 @@ class LowerLevelAllocator:
 
     def _check_capacity_margin(self, r: RouteSegment, flow: float,
                                node_load: Dict[str, float]) -> Tuple[bool, float, List[str]]:
-        """
-        Approximate capacity check:
-        processed volume within plan_horizon_h must be ≤ CAP_node[j] * plan_horizon_h
-        Returns: (fits, min headroom, violating nodes)
-        """
         violating = []
         headrooms = []
         for j in r.nodes:
@@ -404,7 +375,6 @@ class LowerLevelAllocator:
             node_load[j] += flow
 
     def _check_timetable_presence(self, r: RouteSegment) -> List[str]:
-        """If a node lacks rail/sea timetable, flag as potential bottleneck (soft)"""
         missing = []
         for i in range(len(r.nodes)-1):
             j = r.nodes[i]
@@ -423,12 +393,6 @@ class LowerLevelAllocator:
             dv.z_ijmk[key] = 1.0
 
     def _calculate_temporal_variables_light(self, dv: DecisionVariables, aux: AuxiliaryVariables):
-        """
-        Lightweight timing:
-        - Road: depart immediately
-        - Rail/Sea: if timetable exists, depart at earliest feasible service; otherwise, depart immediately
-        - Add processing at transhipment/border/port: TT_jmn / BD_j / CC_j / PORT_HANDLING_H / RAIL_BORDER_GAUGE_H
-        """
         params = self.params
         arcs = self.network['arcs']
         for b in self.model.batches:
@@ -436,7 +400,6 @@ class LowerLevelAllocator:
             aux.a_jk[(b.O_k, k)] = b.ET_k
             dest_arrival = 0.0
 
-            # Build local graph for this batch
             graph = defaultdict(list)
             for (i, j, m, k2), flow in dv.f_ijmk.items():
                 if k2 == k and flow > 0:
@@ -448,30 +411,25 @@ class LowerLevelAllocator:
                 node, arrive_time_at_node = q.popleft()
                 aux.a_jk[(node, k)] = max(aux.a_jk.get((node, k), 0.0), arrive_time_at_node)
 
-                # Processing time (mode change/border/port)
                 process_time = 0.0
                 out_modes = set(m for (_, m, _) in graph.get(node, []))
 
-                # Generic mode-change time (if multiple modes present)
                 if len(out_modes) >= 2:
                     process_time = max(
                         [params.TT_jmn.get((node, m1, m2), 0.0)
                          for m1 in out_modes for m2 in out_modes if m1 != m2] + [0.0]
                     )
 
-                # Border processing (customs/clearance)
                 if params.B_j.get(node, False):
                     process_time += params.BD_j.get(node, 0.0) + params.CC_j.get(node, 0.0)
                     if Mode.RAIL in out_modes:
                         process_time += RAIL_BORDER_GAUGE_H
 
-                # Port handling if WATER is involved
                 if self.network['nodes'].get(node, {}).get('is_port', False):
                     if Mode.WATER in out_modes:
                         process_time += PORT_HANDLING_H
 
                 for (nxt, m, flow) in graph.get(node, []):
-                    # Departure time
                     if m in (Mode.RAIL, Mode.WATER):
                         schedules = params.S_jm.get((node, m), [])
                         ready_time = aux.a_jk[(node, k)] + process_time
@@ -505,9 +463,7 @@ class LowerLevelAllocator:
             aux.delta_k[k] = max(0.0, dest_arrival - b.LT_k)
             aux.t_max = max(aux.t_max, dest_arrival)
 
-# =========================
-# Upper-level Two-Level NSGA-II (strategic)
-# =========================
+# ---------- upper level NSGA-II ----------
 
 class TwoLevelNSGA2:
     def __init__(self, model: MultimodalOptimizationModel,
@@ -529,9 +485,7 @@ class TwoLevelNSGA2:
         self.lower = LowerLevelAllocator(model)
         self.od_pairs = sorted({(b.O_k, b.DEST_k) for b in batches})
 
-    # ---- Path search (strategic, batch-agnostic) ----
     def _road_allowed(self, i: str, j: str, dist_km: float) -> bool:
-        """Allow road only for short drayage; cross-region road must touch a border node"""
         if dist_km is None or dist_km <= 0:
             return False
         if dist_km > ROAD_MAX_KM:
@@ -590,7 +544,6 @@ class TwoLevelNSGA2:
     def evaluate(self, chrom: PortfolioChromosome) -> AllocationResult:
         return self.lower.evaluate(chrom)
 
-    # ---- Genetic operators ----
     def crossover(self, p1: PortfolioChromosome, p2: PortfolioChromosome) -> PortfolioChromosome:
         child_pool: Dict[Tuple[str, str], List[RouteSegment]] = {}
         for od in self.od_pairs:
@@ -635,7 +588,6 @@ class TwoLevelNSGA2:
             mutated.route_pool[od] = new_list
         return mutated
 
-    # ---- Non-dominated sorting + crowding distance ----
     @staticmethod
     def dominates(o1: Tuple[float, float, float], o2: Tuple[float, float, float]) -> bool:
         better = False
@@ -693,10 +645,10 @@ class TwoLevelNSGA2:
                 distances[order[idx]] += (next_val - prev_val) / (maxv - minv)
         return distances
 
-    def run(self) -> List[Tuple[DecisionVariables, Tuple[float, float, float]]]:
-        print(f"Starting Two-Level NSGA-II: pop={self.pop_size}, gen={self.n_generations}")
+    def run(self) -> List[AllocationResult]:
+        print(f"Starting Two-Level NSGA-II: population={self.pop_size}, generations={self.n_generations}")
         population = self.generate_initial_population()
-        last_eval: List[AllocationResult] = [None]*len(population)
+        last_eval: List[Optional[AllocationResult]] = [None]*len(population)
 
         for g in range(self.n_generations):
             objs = []
@@ -727,7 +679,7 @@ class TwoLevelNSGA2:
                 if len(new_population) >= self.pop_size:
                     break
 
-            # Offspring
+            # offspring
             offspring: List[PortfolioChromosome] = []
             while len(offspring) < self.pop_size:
                 p1 = random.choice(new_population)
@@ -740,7 +692,7 @@ class TwoLevelNSGA2:
                 child = self.mutate(child, parent_eval.bottleneck_nodes if parent_eval else [])
                 offspring.append(child)
 
-            # Combine & select
+            # environmental selection
             combined = new_population + offspring
             combined_eval: List[AllocationResult] = []
             combined_objs: List[Tuple[float, float, float]] = []
@@ -774,35 +726,28 @@ class TwoLevelNSGA2:
                 pf_size = len(fronts2[0]) if fronts2 else 0
                 print(f"Generation {g+1}: Pareto front size = {pf_size}")
 
-        # Final Pareto (first front)
+        # final Pareto front (return full AllocationResult for each solution)
         final_objs = [ev.objectives for ev in last_eval]
         final_fronts = self.non_dominated_sort(final_objs)
-        pareto_solutions: List[Tuple[DecisionVariables, Tuple[float, float, float]]] = []
+        pareto_results: List[AllocationResult] = []
         if final_fronts:
             for idx in final_fronts[0]:
-                pareto_solutions.append((last_eval[idx].dv, last_eval[idx].objectives))
-        return pareto_solutions
+                pareto_results.append(last_eval[idx])
+        return pareto_results
 
-# =========================
-# Excel reader & network builder
-# =========================
+# ---------- Excel reader & network builder ----------
 
 class ExcelDataReader:
-    """Read network data from Excel"""
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.df_dict = {}
 
     def read_all_sheets(self):
-        try:
-            xls = pd.ExcelFile(self.filepath)
-            for sheet_name in xls.sheet_names:
-                self.df_dict[sheet_name] = pd.read_excel(self.filepath, sheet_name=sheet_name)
-            print(f"Read file: {self.filepath}")
-            print(f"Sheets: {', '.join(xls.sheet_names)}")
-        except Exception as e:
-            print(f"Error reading Excel: {e}")
-            raise
+        xls = pd.ExcelFile(self.filepath)
+        for sheet_name in xls.sheet_names:
+            self.df_dict[sheet_name] = pd.read_excel(self.filepath, sheet_name=sheet_name)
+        print(f"Loaded workbook: {self.filepath}")
+        print(f"Sheets detected: {', '.join(xls.sheet_names)}")
 
     def normalize_name(self, name) -> str:
         if pd.isna(name) or not name:
@@ -813,14 +758,10 @@ class ExcelDataReader:
 
     def load_network_parameters(self) -> NetworkParameters:
         params = NetworkParameters()
-
-        # Speeds (km/h): operational averages
+        # realistic average operating speeds (km/h)
         params.V_m = {Mode.ROAD: 45.0, Mode.RAIL: 40.0, Mode.WATER: 32.0}
-
-        # Regional carbon prices
         params.CT_r = {'CN': 10.0, 'CA': 15.0, 'RU': 5.0, 'EE': 20.0, 'WE': 25.0}
 
-        # Emission factors (tCO2 / TEU-km; relative scale)
         for mode in Mode:
             for region in ['CN', 'CA', 'RU', 'EE', 'WE']:
                 if mode == Mode.ROAD:
@@ -830,7 +771,6 @@ class ExcelDataReader:
                 else:
                     params.E_mr[(mode, region)] = 0.012
 
-        # Policy multipliers (ETS/subsidies, etc.)
         params.Theta_rm = {
             ('CN', Mode.ROAD): 1.0, ('CN', Mode.RAIL): 1.0, ('CN', Mode.WATER): 1.0,
             ('CA', Mode.ROAD): 1.0, ('CA', Mode.RAIL): 0.8, ('CA', Mode.WATER): 1.0,
@@ -839,7 +779,6 @@ class ExcelDataReader:
             ('WE', Mode.ROAD): 1.0, ('WE', Mode.RAIL): 1.0, ('WE', Mode.WATER): 1.0,
         }
 
-        # Mode-change times (hours; node-specific entries may override)
         for m1 in Mode:
             for m2 in Mode:
                 if m1 != m2:
@@ -857,7 +796,6 @@ class ExcelDataReader:
                     elif m1 == Mode.WATER and m2 == Mode.RAIL:
                         params.TT_jmn[(None, m1, m2)] = 4.0
 
-        # Default weights
         for node in self.get_all_nodes():
             params.W_hold[node] = 2.0
             params.W_proc[node] = 5.0
@@ -886,7 +824,6 @@ class ExcelDataReader:
                             name = self.normalize_name(name)
                             if name:
                                 nodes.add(name)
-        # Add whitelisted ports if absent in Excel
         nodes |= SEA_PORTS_CN | SEA_PORTS_EU
         return nodes
 
@@ -920,12 +857,10 @@ class ExcelDataReader:
                 is_border = any(kw.lower() in name.lower() for kw in border_keywords)
                 nodes[name]['is_border'] = is_border
 
-        # Ensure whitelist ports exist
         for p in (SEA_PORTS_CN | SEA_PORTS_EU):
             if p not in nodes:
                 nodes[p] = {'region': ('CN' if p in SEA_PORTS_CN else 'WE'), 'capacity': 1e6, 'is_border': False}
 
-        # Flag ports
         for name in list(nodes.keys()):
             is_port = (name in SEA_PORTS_CN) or (name in SEA_PORTS_EU)
             nodes[name]['is_port'] = is_port
@@ -993,14 +928,15 @@ class ExcelDataReader:
                     else:
                         schedules[(origin, dest, Mode.RAIL)] = headway
                         schedules[(origin, dest, Mode.WATER)] = headway
-        print(f"Loaded {len(schedules)} service headways")
+        print(f"Loaded {len(schedules)} services (timetables)")
         return schedules
 
     def parse_frequency(self, freq_str: str) -> Optional[float]:
+        # keep Chinese keyword support for robustness with source spreadsheets
         freq_str = freq_str.lower()
-        if 'daily' in freq_str:
+        if 'daily' in freq_str or '每天' in freq_str:
             return 7.0
-        elif 'weekly' in freq_str:
+        elif 'weekly' in freq_str or '每周' in freq_str:
             return 1.0
         elif 'biweekly' in freq_str:
             return 0.5
@@ -1010,9 +946,7 @@ class ExcelDataReader:
                 return float(numbers[0])
         return None
 
-    # === Auto-inject common sea trunks and rail feeders ===
     def _ensure_sea_connectivity(self, nodes, arcs, params):
-        # 1) CN–EU common port-to-port sea trunks (approx distances, km)
         sea_pairs_km = {
             ("Shanghai","Hamburg"): 20300, ("Shanghai","Rotterdam"): 19600, ("Shanghai","Antwerp"): 19850,
             ("Ningbo","Hamburg"): 19900, ("Qingdao","Hamburg"): 18800, ("Tianjin","Hamburg"): 19700,
@@ -1028,12 +962,10 @@ class ExcelDataReader:
                         arcs[key]['distances'][Mode.WATER] = float(dist)
                         if Mode.WATER not in arcs[key]['modes']:
                             arcs[key]['modes'].append(Mode.WATER)
-                # Minimal weekly sea departures to trigger waiting
                 for port in [o,d]:
                     if (port, Mode.WATER) not in params.S_jm or not params.S_jm.get((port, Mode.WATER)):
                         params.S_jm[(port, Mode.WATER)] = [0.0]
 
-        # 2) China inland hubs → CN ports (rail feeders; approx)
         feeder_cn = {
             "Xi'an": {"Qingdao":1500, "Shanghai":1600},
             "Chongqing": {"Shanghai":1700, "Shenzhen":1600},
@@ -1053,7 +985,6 @@ class ExcelDataReader:
                         if Mode.RAIL not in arcs[key]['modes']:
                             arcs[key]['modes'].append(Mode.RAIL)
 
-        # 3) EU ports → inland destinations (rail feeders; approx)
         feeder_eu_rail = {
             "Hamburg": {"Berlin":290, "Duisburg":380, "Munich":790},
             "Rotterdam": {"Duisburg":230, "Berlin":680},
@@ -1072,7 +1003,6 @@ class ExcelDataReader:
                         if Mode.RAIL not in arcs[key]['modes']:
                             arcs[key]['modes'].append(Mode.RAIL)
 
-        # 4) Maintain params.arc_modes
         for (o,d), data in arcs.items():
             params.arc_modes[(o,d)] = data['modes']
 
@@ -1083,13 +1013,11 @@ class ExcelDataReader:
         schedules = self.load_schedules()
         params = self.load_network_parameters()
 
-        # Map node attributes
         for node_name, node_data in nodes.items():
             params.rho[node_name] = node_data['region']
-            params.CAP_node[node_name] = float(node_data['capacity'])  # TEU/h
+            params.CAP_node[node_name] = float(node_data['capacity'])
             params.B_j[node_name] = node_data.get('is_border', False)
 
-        # Map arc attributes & unit costs
         for (origin, dest), arc_data in arcs.items():
             for mode, distance in arc_data['distances'].items():
                 params.L_ij[(origin, dest)] = distance
@@ -1104,7 +1032,6 @@ class ExcelDataReader:
                 if nodes[origin]['region'] != nodes[dest]['region']:
                     params.I_border[(origin, dest)] = True
 
-        # Build weekly departure times from headways
         for (origin, dest, mode), headway in schedules.items():
             schedule_times = []
             t = 0.0
@@ -1118,18 +1045,12 @@ class ExcelDataReader:
                 merged = sorted(set(params.S_jm[key] + schedule_times))
                 params.S_jm[key] = merged
 
-        # Inject sea & feeders if missing
         self._ensure_sea_connectivity(nodes, arcs, params)
 
         network = {'nodes': nodes, 'arcs': arcs, 'schedules': schedules}
-
-        # Optional: unify capacities for experiments
-        # for j in params.CAP_node.keys():
-        #     params.CAP_node[j] = 250.0
-
         return params, network
 
-# ========= Detailed allocation report (node view) =========
+# ---------- reporting helpers ----------
 
 def build_allocation_report(model: MultimodalOptimizationModel,
                             dv: DecisionVariables) -> str:
@@ -1151,40 +1072,38 @@ def build_allocation_report(model: MultimodalOptimizationModel,
             batch_node_splits[k][j].append((m, n, y))
 
     lines = []
-    lines.append("\nDetailed allocation & transhipment")
+    lines.append("\nDetailed allocation and splitting information")
     lines.append("-" * 80)
 
     for b in model.batches:
-        lines.append(f"\nBatch {b.id}: {b.O_k} -> {b.DEST_k}, demand={b.Q_k:.2f} TEU")
+        lines.append(f"\nBatch {b.id}: {b.O_k} → {b.DEST_k}, demand={b.Q_k:.2f} TEU")
         has_flow = any(k2 == b.id and f > 0 for (_, _, _, k2), f in dv.f_ijmk.items())
         if not has_flow:
-            lines.append("  * Not allocated (infeasible pool or capacity conflict)")
+            lines.append("  * Not allocated (upper-level portfolio infeasible or capacity conflicts)")
             continue
 
         if b.id in batch_node_splits:
             for j, items in batch_node_splits[b.id].items():
                 cap = params.CAP_node.get(j, float('inf'))
                 batch_through = node_throughput_by_batch.get((j, b.id), 0.0)
-                lines.append(f"  - Node {j}: capacity={cap:.2f} TEU/h, batch throughput={batch_through:.2f} TEU")
+                lines.append(f"  - Node {j}: capacity={cap:.2f} TEU/h, batch throughput here={batch_through:.2f} TEU")
                 for (m, n, y) in sorted(items, key=lambda x: -x[2]):
-                    lines.append(f"      · Mode change: {Mode(m).name} → {Mode(n).name}, volume={y:.2f} TEU")
+                    lines.append(f"      · Split/transhipment: {Mode(m).name} → {Mode(n).name}, volume={y:.2f} TEU")
         else:
-            lines.append("  * No mode change (single-mode or direct path)")
+            lines.append("  * No splitting/transhipment for this batch (single-path or same-mode handover)")
 
     lines.append("\nNode throughput overview (all batches aggregated)")
     lines.append("-" * 80)
     for j, tot in sorted(node_throughput.items(), key=lambda x: -x[1]):
         cap = params.CAP_node.get(j, float('inf'))
-        lines.append(f"  Node {j}: capacity={cap:.2f} TEU/h, throughput={tot:.2f} TEU")
+        lines.append(f"  Node {j}: capacity={cap:.2f} TEU/h, actual aggregated throughput={tot:.2f} TEU")
 
     return "\n".join(lines)
-
-# ========= Route decomposition (per batch) =========
 
 def _decompose_batch_paths(model: MultimodalOptimizationModel,
                            dv: DecisionVariables,
                            batch: Batch) -> List[Tuple[List[str], List[Mode], float]]:
-    flow = defaultdict(float)  # key=(i,j,m)
+    flow = defaultdict(float)
     for (i, j, m, k), v in dv.f_ijmk.items():
         if k == batch.id and v > 1e-9:
             flow[(i, j, m)] += v
@@ -1233,7 +1152,6 @@ def _decompose_batch_paths(model: MultimodalOptimizationModel,
 
     return paths
 
-
 def build_route_report(model: MultimodalOptimizationModel, dv: DecisionVariables) -> str:
     params = model.params
     aux = AuxiliaryVariables()
@@ -1245,44 +1163,53 @@ def build_route_report(model: MultimodalOptimizationModel, dv: DecisionVariables
             batch_node_in[(k, j)] += v
 
     lines = []
-    lines.append("\nFull route decomposition (per batch)")
+    lines.append("\nRoute decomposition (per batch)")
     lines.append("-" * 80)
 
     for b in model.batches:
         paths = _decompose_batch_paths(model, dv, b)
-        lines.append(f"\nBatch {b.id}: {b.O_k} -> {b.DEST_k}, demand={b.Q_k:.2f} TEU")
+        lines.append(f"\nBatch {b.id}: {b.O_k} → {b.DEST_k}, demand={b.Q_k:.2f} TEU")
         if not paths:
-            lines.append("  * No complete O→D path found (flows fragmented or unreachable)")
+            lines.append("  * No complete O→D path found (flows fragmented or destination unreachable)")
             continue
 
         tot = sum(p[2] for p in paths)
-        lines.append(f"  · Number of paths={len(paths)}, total allocated≈{tot:.2f} TEU")
+        lines.append(f"  · number of paths={len(paths)}, total allocated flow≈{tot:.2f} TEU")
         for idx, (nodes, modes, q) in enumerate(paths, 1):
             steps = []
             for a, b2, m in zip(nodes[:-1], nodes[1:], modes):
                 steps.append(f"{a} —[{Mode(m).name}]→ {b2}")
             route_str = "  ->  ".join(steps)
-            lines.append(f"    Path {idx}: {route_str}  | volume={q:.2f} TEU")
+            lines.append(f"    Path {idx}: {route_str}  | flow={q:.2f} TEU")
 
         splits = [(j, m, n, k, y) for (j, m, n, k), y in aux.y_jmnk.items() if k == b.id and y > 1e-9]
         if splits:
-            lines.append("  · Mode-change nodes:")
+            lines.append("  · Nodes with mode switching / split volume:")
             for (j, m, n, _, y) in sorted(splits, key=lambda x: -x[4]):
                 cap = params.CAP_node.get(j, float('inf'))
                 thr = batch_node_in.get((b.id, j), 0.0)
-                lines.append(f"      {j}: {Mode(m).name}→{Mode(n).name}, volume={y:.2f} TEU; "
-                             f"node cap={cap:.2f} TEU/h, batch throughput here={thr:.2f} TEU")
+                lines.append(f"      {j}: {Mode(m).name}→{Mode(n).name}, split={y:.2f} TEU; "
+                             f"capacity={cap:.2f} TEU/h, batch throughput here={thr:.2f} TEU")
         else:
-            lines.append("  · No mode changes")
+            lines.append("  · No mode switching for this batch (no split nodes)")
 
     return "\n".join(lines)
 
-# =========================
-# Main
-# =========================
+def format_batch_times(model: MultimodalOptimizationModel, aux: AuxiliaryVariables) -> str:
+    """Pretty table for per-batch total time (ET -> arrival at DEST) and tardiness."""
+    lines = []
+    lines.append("\nPer-batch total time (ET → arrival at DEST)")
+    lines.append("-" * 80)
+    for b in model.batches:
+        arr = max([t for (j, k), t in aux.a_jk.items() if k == b.id and j == b.DEST_k], default=b.ET_k)
+        total_h = arr - b.ET_k
+        tard = max(0.0, arr - b.LT_k)
+        lines.append(f"Batch {b.id}: {b.O_k} → {b.DEST_k} | total={total_h:.2f} h ({total_h/24:.1f} d) | tardiness={tard:.2f} h")
+    return "\n".join(lines)
+
+# ---------- main ----------
 
 def main():
-    """Run the two-level NSGA-II optimisation"""
     import sys
 
     possible_paths = [
@@ -1298,18 +1225,18 @@ def main():
             excel_file = path
             break
     if not excel_file:
-        print("Error: extended.xlsx not found")
-        print("Please place the file in one of:")
+        print("Error: 'extended.xlsx' not found.")
+        print("Please ensure the file exists in one of the following locations:")
         for path in possible_paths:
             print(f"  - {path}")
         sys.exit(1)
 
-    print(f"Using file: {excel_file}")
+    print(f"Using data file: {excel_file}")
     print("="*80)
     reader = ExcelDataReader(excel_file)
     params, network = reader.build_network_data()
 
-    # Build batches
+    # batches
     batches: List[Batch] = []
     major_origins = ["Xi'an", "Chongqing", "Zhengzhou", "Wuhan"]
     major_destinations = ["Berlin", "Hamburg", "Duisburg", "Munich"]
@@ -1323,7 +1250,7 @@ def main():
                     DEST_k=dest,
                     Q_k=random.uniform(50, 150),
                     ET_k=0.0,
-                    LT_k=960.0  # 40 days horizon by default
+                    LT_k=960.0  # ~40 days
                 )
                 batches.append(batch)
                 batch_id += 1
@@ -1346,15 +1273,14 @@ def main():
 
     print(f"Created {len(batches)} batches:")
     for batch in batches[:12]:
-        print(f"  Batch {batch.id}: {batch.O_k} -> {batch.DEST_k}, {batch.Q_k:.1f} TEU")
+        print(f"  Batch {batch.id}: {batch.O_k} → {batch.DEST_k}, {batch.Q_k:.1f} TEU")
     if len(batches) > 12:
-        print(f"  ... (remaining {len(batches)-12} omitted)")
+        print(f"  ... (remaining {len(batches)-12} batches omitted)")
 
-    print("\nStarting two-level optimisation...")
+    print("\nCommencing two-level optimisation...")
     print("="*80)
     model = MultimodalOptimizationModel(params, network, batches)
 
-    # Two-Level NSGA-II
     tl_nsga2 = TwoLevelNSGA2(
         model=model,
         batches=batches,
@@ -1364,46 +1290,52 @@ def main():
         mutation_prob=0.25,
         max_paths_per_od=3
     )
-    pareto_solutions = tl_nsga2.run()
+    pareto_results = tl_nsga2.run()
 
     print("\n" + "="*80)
     print("Pareto-optimal solutions")
     print("="*80)
-    if pareto_solutions:
-        pareto_solutions.sort(key=lambda x: x[1][0])   # Show top-10 by cost
-        for i, (solution, objectives) in enumerate(pareto_solutions[:10], 1):
+    if pareto_results:
+        pareto_sorted = sorted(pareto_results, key=lambda r: r.objectives[0])
+        for i, res in enumerate(pareto_sorted[:10], 1):
+            c, e, t = res.objectives
             print(f"\nSolution {i}:")
-            print(f"  Objective 1 – Total cost: ${objectives[0]:,.2f}")
-            print(f"  Objective 2 – Total emissions: {objectives[1]:.2f} tCO2")
-            print(f"  Objective 3 – Completion time: {objectives[2]:.2f} h ({objectives[2]/24:.1f} days)")
+            print(f"  Objective 1 — Total cost: £{c:,.2f}")
+            print(f"  Objective 2 — Total emissions: {e:.2f} tonnes CO2")
+            print(f"  Objective 3 — Makespan: {t:.2f} h ({t/24:.1f} d)")
+        # also print per-batch times to console for the best cost solution
+        print(format_batch_times(model, pareto_sorted[0].aux))
     else:
-        print("No feasible solution found. Please check network connectivity/data quality.")
+        print("No feasible solution found. Please check network connectivity or data quality.")
 
-    # Write report
-    output_file = 'optimisation_results.txt'
+    # write file (incl. per-batch total time for the best-cost solution)
+    output_file = 'optimization_results.txt'
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("Multi-batch multimodal network optimisation results (two-level NSGA-II)\n")
+        f.write("Multi-batch Multimodal Transport Optimisation Results (Two-Level NSGA-II)\n")
         f.write("="*80 + "\n\n")
         f.write(f"Data source: {excel_file}\n")
         f.write(f"Number of batches: {len(batches)}\n")
         f.write(f"Number of nodes: {len(network['nodes'])}\n")
         f.write(f"Number of arcs: {len(network['arcs'])}\n\n")
-        if pareto_solutions:
-            f.write("Pareto front:\n")
-            for i, (_, objectives) in enumerate(pareto_solutions, 1):
-                f.write(f"Solution {i}: cost=${objectives[0]:.2f}, emissions={objectives[1]:.2f} tCO2, time={objectives[2]:.2f} h\n")
+        if pareto_results:
+            f.write("Pareto front solutions:\n")
+            for i, res in enumerate(pareto_results, 1):
+                c, e, t = res.objectives
+                f.write(f"Solution {i}: cost=£{c:.2f}, emissions={e:.2f} tCO2, time={t:.2f} h\n")
 
-            # Pick the lowest-cost solution for detailed reports
-            best_sol_dv, _ = sorted(pareto_solutions, key=lambda x: x[1][0])[0]
-            detail_report = build_allocation_report(model, best_sol_dv)
+            best_res = sorted(pareto_results, key=lambda r: r.objectives[0])[0]
+            best_sol_dv = best_res.dv
+
             f.write("\n")
-            f.write(detail_report)
-
-            route_report = build_route_report(model, best_sol_dv)
+            f.write(build_allocation_report(model, best_sol_dv))
             f.write("\n")
-            f.write(route_report)
+            f.write(build_route_report(model, best_sol_dv))
+            f.write("\n")
+            f.write(format_batch_times(model, best_res.aux))
+        else:
+            f.write("No feasible solution found. Please check network connectivity or data quality.\n")
 
-    print(f"\nResults saved to: {output_file}")
+    print(f"\nResults written to: {output_file}")
 
 if __name__ == "__main__":
     main()
