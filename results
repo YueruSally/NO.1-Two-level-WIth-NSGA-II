@@ -1,0 +1,301 @@
+多批次多式联运网络优化结果（两层NSGA-II）
+================================================================================
+
+数据来源: extended.xlsx
+批次数量: 12
+节点数量: 56
+弧段数量: 1296
+
+Pareto前沿解:
+解 1: 成本=$20585407.16, 排放=408688.15tCO2, 时间=1018.06h
+解 2: 成本=$20662213.54, 排放=412950.92tCO2, 时间=932.74h
+解 3: 成本=$20546501.75, 排放=411073.50tCO2, 时间=961.50h
+解 4: 成本=$20662213.54, 排放=412950.92tCO2, 时间=932.74h
+解 5: 成本=$20666469.12, 排放=412375.87tCO2, 时间=932.74h
+解 6: 成本=$20581151.58, 排放=409263.20tCO2, 时间=1018.06h
+解 7: 成本=$20623760.40, 排放=409926.49tCO2, 时间=1013.23h
+解 8: 成本=$20550757.33, 排放=410498.45tCO2, 时间=961.50h
+解 9: 成本=$20630174.16, 排放=411868.22tCO2, 时间=959.25h
+解 10: 成本=$20585407.16, 排放=408688.15tCO2, 时间=1018.06h
+解 11: 成本=$20630174.16, 排放=411868.22tCO2, 时间=959.25h
+解 12: 成本=$20581151.58, 排放=409263.20tCO2, 时间=1018.06h
+解 13: 成本=$20623760.40, 排放=409926.49tCO2, 时间=1013.23h
+解 14: 成本=$20550757.33, 排放=410498.45tCO2, 时间=961.50h
+解 15: 成本=$20625918.57, 排放=412443.27tCO2, 时间=959.25h
+解 16: 成本=$20666469.12, 排放=412375.87tCO2, 时间=932.74h
+解 17: 成本=$20625918.57, 排放=412443.27tCO2, 时间=959.25h
+解 18: 成本=$20662213.54, 排放=412950.92tCO2, 时间=932.74h
+解 19: 成本=$20585407.16, 排放=408688.15tCO2, 时间=1018.06h
+解 20: 成本=$20630174.16, 排放=411868.22tCO2, 时间=959.25h
+解 21: 成本=$20581151.58, 排放=409263.20tCO2, 时间=1018.06h
+解 22: 成本=$20623760.40, 排放=409926.49tCO2, 时间=1013.23h
+解 23: 成本=$20550757.33, 排放=410498.45tCO2, 时间=961.50h
+解 24: 成本=$20666469.12, 排放=412375.87tCO2, 时间=932.74h
+解 25: 成本=$20625918.57, 排放=412443.27tCO2, 时间=959.25h
+解 26: 成本=$20662213.54, 排放=412950.92tCO2, 时间=932.74h
+解 27: 成本=$20585407.16, 排放=408688.15tCO2, 时间=1018.06h
+解 28: 成本=$20581151.58, 排放=409263.20tCO2, 时间=1018.06h
+解 29: 成本=$20630174.16, 排放=411868.22tCO2, 时间=959.25h
+解 30: 成本=$20623760.40, 排放=409926.49tCO2, 时间=1013.23h
+
+
+详细分配与拆分信息
+--------------------------------------------------------------------------------
+
+批次 1: Xi'an -> Berlin, 需求=111.61 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: RAIL → ROAD, 量=111.61 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: ROAD → RAIL, 量=111.61 TEU
+  - 节点 Hamburg: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: WATER → RAIL, 量=111.61 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: ROAD → RAIL, 量=111.61 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: RAIL → ROAD, 量=111.61 TEU
+  - 节点 Duisburg: 设定容量=250.00 TEU/h, 本批次在此通过量=111.61 TEU
+      · 拆分/转运: RAIL → WATER, 量=111.61 TEU
+
+批次 2: Xi'an -> Hamburg, 需求=130.20 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=130.20 TEU
+      · 拆分/转运: RAIL → ROAD, 量=130.20 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=130.20 TEU
+      · 拆分/转运: ROAD → RAIL, 量=130.20 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=130.20 TEU
+      · 拆分/转运: ROAD → RAIL, 量=130.20 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=130.20 TEU
+      · 拆分/转运: RAIL → ROAD, 量=130.20 TEU
+  - 节点 Duisburg: 设定容量=250.00 TEU/h, 本批次在此通过量=130.20 TEU
+      · 拆分/转运: RAIL → WATER, 量=130.20 TEU
+
+批次 3: Xi'an -> Duisburg, 需求=148.17 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=148.17 TEU
+      · 拆分/转运: RAIL → ROAD, 量=148.17 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=148.17 TEU
+      · 拆分/转运: ROAD → RAIL, 量=148.17 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=148.17 TEU
+      · 拆分/转运: ROAD → RAIL, 量=148.17 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=148.17 TEU
+      · 拆分/转运: RAIL → ROAD, 量=148.17 TEU
+
+批次 4: Chongqing -> Berlin, 需求=70.29 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: RAIL → ROAD, 量=70.29 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=70.29 TEU
+  - 节点 Hamburg: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: WATER → RAIL, 量=70.29 TEU
+  - 节点 Chengdu: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=70.29 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=70.29 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: RAIL → ROAD, 量=70.29 TEU
+  - 节点 Duisburg: 设定容量=250.00 TEU/h, 本批次在此通过量=70.29 TEU
+      · 拆分/转运: RAIL → WATER, 量=70.29 TEU
+
+批次 5: Chongqing -> Hamburg, 需求=144.19 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: RAIL → ROAD, 量=144.19 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: ROAD → RAIL, 量=144.19 TEU
+  - 节点 Chengdu: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: ROAD → RAIL, 量=144.19 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: ROAD → RAIL, 量=144.19 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: RAIL → ROAD, 量=144.19 TEU
+  - 节点 Duisburg: 设定容量=250.00 TEU/h, 本批次在此通过量=144.19 TEU
+      · 拆分/转运: RAIL → WATER, 量=144.19 TEU
+
+批次 6: Chongqing -> Duisburg, 需求=63.29 TEU
+  - 节点 Minsk: 设定容量=250.00 TEU/h, 本批次在此通过量=63.29 TEU
+      · 拆分/转运: RAIL → ROAD, 量=63.29 TEU
+  - 节点 Almaty: 设定容量=250.00 TEU/h, 本批次在此通过量=63.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=63.29 TEU
+  - 节点 Chengdu: 设定容量=250.00 TEU/h, 本批次在此通过量=63.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=63.29 TEU
+  - 节点 Malaszewicze: 设定容量=250.00 TEU/h, 本批次在此通过量=63.29 TEU
+      · 拆分/转运: ROAD → RAIL, 量=63.29 TEU
+  - 节点 Khorgos: 设定容量=250.00 TEU/h, 本批次在此通过量=63.29 TEU
+      · 拆分/转运: RAIL → ROAD, 量=63.29 TEU
+
+批次 7: Zhengzhou -> Berlin, 需求=75.95 TEU
+  - 节点 Lianyungang: 设定容量=250.00 TEU/h, 本批次在此通过量=75.95 TEU
+      · 拆分/转运: ROAD → WATER, 量=75.95 TEU
+  - 节点 Hamburg: 设定容量=250.00 TEU/h, 本批次在此通过量=75.95 TEU
+      · 拆分/转运: WATER → RAIL, 量=75.95 TEU
+  - 节点 Wuhan: 设定容量=250.00 TEU/h, 本批次在此通过量=75.95 TEU
+      · 拆分/转运: RAIL → ROAD, 量=75.95 TEU
+
+批次 8: Zhengzhou -> Hamburg, 需求=107.55 TEU
+  - 节点 Lianyungang: 设定容量=250.00 TEU/h, 本批次在此通过量=107.55 TEU
+      · 拆分/转运: ROAD → WATER, 量=107.55 TEU
+  - 节点 Wuhan: 设定容量=250.00 TEU/h, 本批次在此通过量=107.55 TEU
+      · 拆分/转运: RAIL → ROAD, 量=107.55 TEU
+
+批次 9: Zhengzhou -> Duisburg, 需求=126.65 TEU
+  - 节点 Lianyungang: 设定容量=250.00 TEU/h, 本批次在此通过量=126.65 TEU
+      · 拆分/转运: ROAD → WATER, 量=126.65 TEU
+  - 节点 Hamburg: 设定容量=250.00 TEU/h, 本批次在此通过量=126.65 TEU
+      · 拆分/转运: WATER → RAIL, 量=126.65 TEU
+  - 节点 Wuhan: 设定容量=250.00 TEU/h, 本批次在此通过量=126.65 TEU
+      · 拆分/转运: RAIL → ROAD, 量=126.65 TEU
+
+批次 10: Wuhan -> Berlin, 需求=148.21 TEU
+  * 本批次未发生节点拆分/转运（可能是单一路径直达或仅同模态衔接）
+
+批次 11: Wuhan -> Hamburg, 需求=72.48 TEU
+  - 节点 Berlin: 设定容量=250.00 TEU/h, 本批次在此通过量=72.48 TEU
+      · 拆分/转运: RAIL → ROAD, 量=72.48 TEU
+
+批次 12: Wuhan -> Duisburg, 需求=75.53 TEU
+  - 节点 Berlin: 设定容量=250.00 TEU/h, 本批次在此通过量=75.53 TEU
+      · 拆分/转运: RAIL → ROAD, 量=75.53 TEU
+  - 节点 Hamburg: 设定容量=250.00 TEU/h, 本批次在此通过量=75.53 TEU
+      · 拆分/转运: ROAD → WATER, 量=75.53 TEU
+
+节点总通过量总览（所有批次聚合）
+--------------------------------------------------------------------------------
+  节点 Hamburg: 设定容量=250.00 TEU/h, 实际通过量(聚合)=914.44 TEU
+  节点 Duisburg: 设定容量=250.00 TEU/h, 实际通过量(聚合)=869.93 TEU
+  节点 Khorgos: 设定容量=250.00 TEU/h, 实际通过量(聚合)=667.74 TEU
+  节点 Almaty: 设定容量=250.00 TEU/h, 实际通过量(聚合)=667.74 TEU
+  节点 Astana: 设定容量=250.00 TEU/h, 实际通过量(聚合)=667.74 TEU
+  节点 Minsk: 设定容量=250.00 TEU/h, 实际通过量(聚合)=667.74 TEU
+  节点 Malaszewicze: 设定容量=250.00 TEU/h, 实际通过量(聚合)=667.74 TEU
+  节点 Erenhot: 设定容量=250.00 TEU/h, 实际通过量(聚合)=606.37 TEU
+  节点 Moscow: 设定容量=250.00 TEU/h, 实际通过量(聚合)=606.37 TEU
+  节点 Berlin: 设定容量=250.00 TEU/h, 实际通过量(聚合)=554.07 TEU
+  节点 Urumqi: 设定容量=250.00 TEU/h, 实际通过量(聚合)=389.98 TEU
+  节点 Manzhouli: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Yekaterinburg: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Wuhan: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Hefei: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Nanjing: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Lianyungang: 设定容量=250.00 TEU/h, 实际通过量(聚合)=310.15 TEU
+  节点 Lodz: 设定容量=250.00 TEU/h, 实际通过量(聚合)=296.22 TEU
+  节点 Chengdu: 设定容量=250.00 TEU/h, 实际通过量(聚合)=277.77 TEU
+  节点 Rotterdam: 设定容量=250.00 TEU/h, 实际通过量(聚合)=111.61 TEU
+
+完整路线分解（每个批次）
+--------------------------------------------------------------------------------
+
+批次 1: Xi'an -> Berlin, 需求=111.61 TEU
+  · 路径条数=1，总已分配流量≈111.61 TEU
+    路径 1: Xi'an —[RAIL]→ Urumqi  ->  Urumqi —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  ->  Duisburg —[WATER]→ Rotterdam  ->  Rotterdam —[WATER]→ Hamburg  ->  Hamburg —[RAIL]→ Berlin  | 流量=111.61 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+      Almaty: ROAD→RAIL, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+      Hamburg: WATER→RAIL, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+      Khorgos: RAIL→ROAD, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+      Duisburg: RAIL→WATER, 拆分量=111.61 TEU；设定容量=250.00 TEU/h，本批次在此通过量=111.61 TEU
+
+批次 2: Xi'an -> Hamburg, 需求=130.20 TEU
+  · 路径条数=1，总已分配流量≈130.20 TEU
+    路径 1: Xi'an —[RAIL]→ Urumqi  ->  Urumqi —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  ->  Duisburg —[WATER]→ Hamburg  | 流量=130.20 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=130.20 TEU；设定容量=250.00 TEU/h，本批次在此通过量=130.20 TEU
+      Almaty: ROAD→RAIL, 拆分量=130.20 TEU；设定容量=250.00 TEU/h，本批次在此通过量=130.20 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=130.20 TEU；设定容量=250.00 TEU/h，本批次在此通过量=130.20 TEU
+      Khorgos: RAIL→ROAD, 拆分量=130.20 TEU；设定容量=250.00 TEU/h，本批次在此通过量=130.20 TEU
+      Duisburg: RAIL→WATER, 拆分量=130.20 TEU；设定容量=250.00 TEU/h，本批次在此通过量=130.20 TEU
+
+批次 3: Xi'an -> Duisburg, 需求=148.17 TEU
+  · 路径条数=1，总已分配流量≈148.17 TEU
+    路径 1: Xi'an —[RAIL]→ Urumqi  ->  Urumqi —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  | 流量=148.17 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=148.17 TEU；设定容量=250.00 TEU/h，本批次在此通过量=148.17 TEU
+      Almaty: ROAD→RAIL, 拆分量=148.17 TEU；设定容量=250.00 TEU/h，本批次在此通过量=148.17 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=148.17 TEU；设定容量=250.00 TEU/h，本批次在此通过量=148.17 TEU
+      Khorgos: RAIL→ROAD, 拆分量=148.17 TEU；设定容量=250.00 TEU/h，本批次在此通过量=148.17 TEU
+
+批次 4: Chongqing -> Berlin, 需求=70.29 TEU
+  · 路径条数=1，总已分配流量≈70.29 TEU
+    路径 1: Chongqing —[ROAD]→ Chengdu  ->  Chengdu —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  ->  Duisburg —[WATER]→ Hamburg  ->  Hamburg —[RAIL]→ Berlin  | 流量=70.29 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Almaty: ROAD→RAIL, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Hamburg: WATER→RAIL, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Chengdu: ROAD→RAIL, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Khorgos: RAIL→ROAD, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+      Duisburg: RAIL→WATER, 拆分量=70.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=70.29 TEU
+
+批次 5: Chongqing -> Hamburg, 需求=144.19 TEU
+  · 路径条数=1，总已分配流量≈144.19 TEU
+    路径 1: Chongqing —[ROAD]→ Chengdu  ->  Chengdu —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  ->  Duisburg —[WATER]→ Hamburg  | 流量=144.19 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+      Almaty: ROAD→RAIL, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+      Chengdu: ROAD→RAIL, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+      Khorgos: RAIL→ROAD, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+      Duisburg: RAIL→WATER, 拆分量=144.19 TEU；设定容量=250.00 TEU/h，本批次在此通过量=144.19 TEU
+
+批次 6: Chongqing -> Duisburg, 需求=63.29 TEU
+  · 路径条数=1，总已分配流量≈63.29 TEU
+    路径 1: Chongqing —[ROAD]→ Chengdu  ->  Chengdu —[RAIL]→ Khorgos  ->  Khorgos —[ROAD]→ Almaty  ->  Almaty —[RAIL]→ Astana  ->  Astana —[RAIL]→ Minsk  ->  Minsk —[ROAD]→ Malaszewicze  ->  Malaszewicze —[RAIL]→ Duisburg  | 流量=63.29 TEU
+  · 拆分/转运节点：
+      Minsk: RAIL→ROAD, 拆分量=63.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=63.29 TEU
+      Almaty: ROAD→RAIL, 拆分量=63.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=63.29 TEU
+      Chengdu: ROAD→RAIL, 拆分量=63.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=63.29 TEU
+      Malaszewicze: ROAD→RAIL, 拆分量=63.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=63.29 TEU
+      Khorgos: RAIL→ROAD, 拆分量=63.29 TEU；设定容量=250.00 TEU/h，本批次在此通过量=63.29 TEU
+
+批次 7: Zhengzhou -> Berlin, 需求=75.95 TEU
+  · 路径条数=1，总已分配流量≈75.95 TEU
+    路径 1: Zhengzhou —[RAIL]→ Manzhouli  ->  Manzhouli —[RAIL]→ Yekaterinburg  ->  Yekaterinburg —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Wuhan  ->  Wuhan —[ROAD]→ Hefei  ->  Hefei —[ROAD]→ Nanjing  ->  Nanjing —[ROAD]→ Lianyungang  ->  Lianyungang —[WATER]→ Hamburg  ->  Hamburg —[RAIL]→ Berlin  | 流量=75.95 TEU
+  · 拆分/转运节点：
+      Lianyungang: ROAD→WATER, 拆分量=75.95 TEU；设定容量=250.00 TEU/h，本批次在此通过量=75.95 TEU
+      Hamburg: WATER→RAIL, 拆分量=75.95 TEU；设定容量=250.00 TEU/h，本批次在此通过量=75.95 TEU
+      Wuhan: RAIL→ROAD, 拆分量=75.95 TEU；设定容量=250.00 TEU/h，本批次在此通过量=75.95 TEU
+
+批次 8: Zhengzhou -> Hamburg, 需求=107.55 TEU
+  · 路径条数=1，总已分配流量≈107.55 TEU
+    路径 1: Zhengzhou —[RAIL]→ Manzhouli  ->  Manzhouli —[RAIL]→ Yekaterinburg  ->  Yekaterinburg —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Wuhan  ->  Wuhan —[ROAD]→ Hefei  ->  Hefei —[ROAD]→ Nanjing  ->  Nanjing —[ROAD]→ Lianyungang  ->  Lianyungang —[WATER]→ Hamburg  | 流量=107.55 TEU
+  · 拆分/转运节点：
+      Lianyungang: ROAD→WATER, 拆分量=107.55 TEU；设定容量=250.00 TEU/h，本批次在此通过量=107.55 TEU
+      Wuhan: RAIL→ROAD, 拆分量=107.55 TEU；设定容量=250.00 TEU/h，本批次在此通过量=107.55 TEU
+
+批次 9: Zhengzhou -> Duisburg, 需求=126.65 TEU
+  · 路径条数=1，总已分配流量≈126.65 TEU
+    路径 1: Zhengzhou —[RAIL]→ Manzhouli  ->  Manzhouli —[RAIL]→ Yekaterinburg  ->  Yekaterinburg —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Wuhan  ->  Wuhan —[ROAD]→ Hefei  ->  Hefei —[ROAD]→ Nanjing  ->  Nanjing —[ROAD]→ Lianyungang  ->  Lianyungang —[WATER]→ Hamburg  ->  Hamburg —[RAIL]→ Duisburg  | 流量=126.65 TEU
+  · 拆分/转运节点：
+      Lianyungang: ROAD→WATER, 拆分量=126.65 TEU；设定容量=250.00 TEU/h，本批次在此通过量=126.65 TEU
+      Hamburg: WATER→RAIL, 拆分量=126.65 TEU；设定容量=250.00 TEU/h，本批次在此通过量=126.65 TEU
+      Wuhan: RAIL→ROAD, 拆分量=126.65 TEU；设定容量=250.00 TEU/h，本批次在此通过量=126.65 TEU
+
+批次 10: Wuhan -> Berlin, 需求=148.21 TEU
+  · 路径条数=1，总已分配流量≈148.21 TEU
+    路径 1: Wuhan —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Lodz  ->  Lodz —[RAIL]→ Berlin  | 流量=148.21 TEU
+  · 本批次未发生模式转换（无拆分点）
+
+批次 11: Wuhan -> Hamburg, 需求=72.48 TEU
+  · 路径条数=1，总已分配流量≈72.48 TEU
+    路径 1: Wuhan —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Lodz  ->  Lodz —[RAIL]→ Berlin  ->  Berlin —[ROAD]→ Hamburg  | 流量=72.48 TEU
+  · 拆分/转运节点：
+      Berlin: RAIL→ROAD, 拆分量=72.48 TEU；设定容量=250.00 TEU/h，本批次在此通过量=72.48 TEU
+
+批次 12: Wuhan -> Duisburg, 需求=75.53 TEU
+  · 路径条数=1，总已分配流量≈75.53 TEU
+    路径 1: Wuhan —[RAIL]→ Erenhot  ->  Erenhot —[RAIL]→ Moscow  ->  Moscow —[RAIL]→ Lodz  ->  Lodz —[RAIL]→ Berlin  ->  Berlin —[ROAD]→ Hamburg  ->  Hamburg —[WATER]→ Duisburg  | 流量=75.53 TEU
+  · 拆分/转运节点：
+      Berlin: RAIL→ROAD, 拆分量=75.53 TEU；设定容量=250.00 TEU/h，本批次在此通过量=75.53 TEU
+      Hamburg: ROAD→WATER, 拆分量=75.53 TEU；设定容量=250.00 TEU/h，本批次在此通过量=75.53 TEU
+
+每个批次的总时间（从ET到到达目的地） / Per-batch total time (ET → arrival at DEST)
+--------------------------------------------------------------------------------
+Batch 1: Xi'an → Berlin | total=455.25h (19.0 d) | tardiness=0.00h
+Batch 2: Xi'an → Hamburg | total=346.06h (14.4 d) | tardiness=0.00h
+Batch 3: Xi'an → Duisburg | total=309.06h (12.9 d) | tardiness=0.00h
+Batch 4: Chongqing → Berlin | total=455.25h (19.0 d) | tardiness=0.00h
+Batch 5: Chongqing → Hamburg | total=402.06h (16.8 d) | tardiness=0.00h
+Batch 6: Chongqing → Duisburg | total=365.06h (15.2 d) | tardiness=0.00h
+Batch 7: Zhengzhou → Berlin | total=959.25h (40.0 d) | tardiness=0.00h
+Batch 8: Zhengzhou → Hamburg | total=925.59h (38.6 d) | tardiness=0.00h
+Batch 9: Zhengzhou → Duisburg | total=961.50h (40.1 d) | tardiness=1.50h
+Batch 10: Wuhan → Berlin | total=346.57h (14.4 d) | tardiness=0.00h
+Batch 11: Wuhan → Hamburg | total=352.26h (14.7 d) | tardiness=0.00h
+Batch 12: Wuhan → Duisburg | total=402.06h (16.8 d) | tardiness=0.00h
