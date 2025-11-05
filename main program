@@ -1,1225 +1,1004 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-import os, re, json, time, copy, random, hashlib
+import math
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Any, Set
-from enum import IntEnum
-from collections import defaultdict, deque
+from typing import Dict, List, Tuple
+
+import numpy as np
 import pandas as pd
 
+# 时间分桶大小（小时）
+TIME_BUCKET_H = 1.0
 
-基础枚举与数据结构
 
+# 数据结构定义
 
-class Mode(IntEnum):
-    ROAD = 1
-    RAIL = 2
-    WATER = 3
 
 @dataclass
-class NetworkParameters:
-    C_ijm: Dict[Tuple[str, str, Mode], float] = field(default_factory=dict)   # 运输单价
-    E_mr: Dict[Tuple[Mode, str], float] = field(default_factory=dict)         # 模式-区域排放因子
-    V_m: Dict[Mode, float] = field(default_factory=dict)                      # 模式速度
-    CT_r: Dict[str, float] = field(default_factory=dict)                      # 区域碳税
-    Theta_rm: Dict[Tuple[str, Mode], float] = field(default_factory=dict)     # 碳税系数
+class Arc:
+    from_node: str
+    to_node: str
+    mode: str
+    distance: float
+    capacity: float              # 每个时间段容量（TEU）
+    cost_per_teu_km: float
+    emission_per_teu_km: float
+    speed_kmh: float
 
-    CAP_node: Dict[str, float] = field(default_factory=dict)                  # 节点吞吐(TEU/h)
-    B_j: Dict[str, bool] = field(default_factory=dict)                        # 是否边境
-    BD_j: Dict[str, float] = field(default_factory=dict)                      # 边检时间
-    CC_j: Dict[str, float] = field(default_factory=dict)                      # 港口海关时间
-    W_proc: Dict[str, float] = field(default_factory=dict)                    # 处理时间
-    W_hold: Dict[str, float] = field(default_factory=dict)                    # 等待成本权重
-    TC_jmn: Dict[Tuple[str, Mode, Mode], float] = field(default_factory=dict) # 转运成本
-    TT_jmn: Dict[Tuple[str, Mode, Mode], float] = field(default_factory=dict) # 转运时间
-    rho: Dict[str, str] = field(default_factory=dict)                         # 节点区域
-    S_jm: Dict[Tuple[str, Mode], List[float]] = field(default_factory=dict)   # 班期槽位(周内小时)
 
-    P_k: Dict[int, float] = field(default_factory=dict)                       # 迟到惩罚
-    M: float = 1e6
+@dataclass
+class TimetableEntry:
+    from_node: str
+    to_node: str
+    mode: str
+    frequency_per_week: float
+    first_departure_hour: float
+    headway_hours: float
+
 
 @dataclass
 class Batch:
-    id: int
-    O_k: str
-    DEST_k: str
-    Q_k: float
-    ET_k: float
-    LT_k: float
-
-@dataclass
-class DecisionVariables:
-    f_ijmk: Dict[Tuple[str, str, Mode, int], float] = field(default_factory=dict)  # 流量
-    z_ijmk: Dict[Tuple[str, str, Mode, int], float] = field(default_factory=dict)  # 弧启用
-
-@dataclass
-class AuxiliaryVariables:
-    y_jmnk: Dict[Tuple[str, Mode, Mode, int], float] = field(default_factory=dict) # 转运量
-    t_max: float = 0.0
-    a_jk: Dict[Tuple[str, int], float] = field(default_factory=dict)               # 到达时刻
-    w_jk: Dict[Tuple[str, int], float] = field(default_factory=dict)               # 等班等待
-    delta_k: Dict[int, float] = field(default_factory=dict)                        # 迟到
-
-
-# 记忆机制
-
-
-class SolutionMemory:
-    def __init__(self, max_size: int = 2000):
-        self.cache = {}
-        self.access = defaultdict(int)
-        self.max_size = max_size
-        self.hit = 0
-        self.miss = 0
-
-    def _key(self, ch_dict: Dict) -> str:
-        s = json.dumps(ch_dict, sort_keys=True, ensure_ascii=False, default=str)
-        return hashlib.md5(s.encode('utf-8')).hexdigest()
-
-    def get(self, ch_dict: Dict):
-        k = self._key(ch_dict)
-        if k in self.cache:
-            self.hit += 1
-            self.access[k] += 1
-            return self.cache[k]['objs']
-        self.miss += 1
-        return None
-
-    def get_full(self, ch_dict: Dict):
-        """拿到 objs + dv + aux（用于最终报告）"""
-        k = self._key(ch_dict)
-        return self.cache.get(k, None)
-
-    def put(self, ch_dict: Dict, objs: Tuple[float, float, float], dv=None, aux=None):
-        k = self._key(ch_dict)
-        if len(self.cache) >= self.max_size:
-            victim = min(self.cache.keys(), key=lambda kk: self.access[kk])
-            del self.cache[victim]; del self.access[victim]
-        self.cache[k] = {'objs': objs, 'dv': dv, 'aux': aux, 'ts': time.time()}
-        self.access[k] = 1
-
-    def stats(self):
-        tot = max(1, self.hit + self.miss)
-        return {'hit': self.hit, 'miss': self.miss, 'hit_rate': self.hit / tot, 'size': len(self.cache)}
-
-
-染色体（上层组合：路径+比例+相位+优先级）
+    batch_id: int
+    origin: str
+    destination: str
+    quantity: float
+    ET: float
+    LT: float
 
 
 @dataclass
-class Chromosome:
-    route_ids: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)          # OD→候选路径索引
-    batch_ratios: Dict[Tuple[str, str, int], List[float]] = field(default_factory=dict)# 批次在路径上的比例
-    dep_phase: Dict[int, float] = field(default_factory=dict)                          # 周内相位(0-168h)
-    dep_index_shift: Dict[Tuple[int, int], int] = field(default_factory=dict)          # 槽位偏移
-    priority: Dict[int, int] = field(default_factory=dict)                             # 1高-3低
-
-    def to_dict(self) -> Dict:
-        return {
-            'route_ids': {f"{o}__{d}": v for (o, d), v in self.route_ids.items()},
-            'batch_ratios': {f"{o}__{d}__{bid}": v for (o, d, bid), v in self.batch_ratios.items()},
-            'dep_phase': self.dep_phase,
-            'dep_index_shift': {f"{bid}__{idx}": s for (bid, idx), s in self.dep_index_shift.items()},
-            'priority': self.priority
-        }
+class Path:
+    path_id: int
+    origin: str
+    destination: str
+    nodes: List[str]
+    modes: List[str]
+    arcs: List[Arc]
+    base_cost_per_teu: float
+    base_emission_per_teu: float
+    base_travel_time_h: float
 
 
-流量感知路径评分（拥堵惩罚）
+@dataclass
+class PathAllocation:
+    path_id: int
+    share: float
 
 
-class FlowAwarePathSelector:
-    def __init__(self, network, arc_capacity_abs: Dict[Tuple[str, str, int], float]):
-        self.network = network
-        self.cap = arc_capacity_abs
-        self.flow = defaultdict(float)
-        self.th = 0.8
-
-    def update_flow(self, i: str, j: str, mode_int: int, add_flow: float):
-        key = ((i, j), mode_int)
-        self.flow[key] = self.flow.get(key, 0.0) + add_flow
-
-    def congestion(self, i: str, j: str, mode_int: int) -> float:
-        key = ((i, j), mode_int)
-        used = self.flow.get(key, 0.0)
-        cap = self.cap.get(key, float('inf'))
-        if cap <= 0 or cap == float('inf'):
-            return 0.0
-        return min(1.0, used / cap)
-
-    def score_path(self, path_arc_ids: List[int]) -> float:
-        arcs = self.network['arc_table']
-        base = 0.0
-        cong_cost = 0.0
-        for aid in path_arc_ids:
-            i, j, m, dist = arcs[aid]
-            mode_factor = {1: 1.5, 2: 1.0, 3: 0.8}.get(m, 1.0)
-            base += dist * mode_factor
-            c = self.congestion(i, j, m)
-            cong_cost += (c if c < self.th else self.th + (c - self.th) ** 2 * 10.0)
-        return base + 100.0 * cong_cost
-
-    def select(self, od: Tuple[str, str], path_library: Dict[Tuple[str, str], List[List[int]]], n: int) -> List[int]:
-        cands = path_library.get(od, [])
-        if not cands:
-            return []
-        scored = [(idx, self.score_path(p)) for idx, p in enumerate(cands)]
-        scored.sort(key=lambda x: x[1])
-        return [idx for idx, _ in scored[:max(1, n)]]
-
-Excel 读取与网络构建
+@dataclass(eq=False)
+class Individual:
+    # 变长度编码：每个 OD 对应一个可变长度路径集合
+    od_allocations: Dict[Tuple[str, str], List[PathAllocation]] = field(default_factory=dict)
+    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
 
 
-SEA_PORTS_CN = {
-    "Shanghai","Ningbo","Qingdao","Tianjin","Dalian","Xiamen",
-    "Shenzhen","Guangzhou","Lianyungang","Yantian","Shekou","Nansha"
-}
-SEA_PORTS_EU = {
-    "Hamburg","Rotterdam","Antwerp","Zeebrugge","Bremerhaven",
-    "Gdansk","Gdynia","Koper","Piraeus","Gioia Tauro","Gothenburg","Felixstowe"
-}
-
-class ExcelDataReader:
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        self.df_dict: Dict[str, pd.DataFrame] = {}
-
-    def read_all(self):
-        xls = pd.ExcelFile(self.filepath)
-        for s in xls.sheet_names:
-            self.df_dict[s] = pd.read_excel(self.filepath, sheet_name=s)
-        print(f"读取: {self.filepath} | 工作表: {', '.join(self.df_dict.keys())}")
-
-    @staticmethod
-    def norm_name(x) -> str:
-        if pd.isna(x) or x is None: return ""
-        return re.sub(r'\s+', ' ', str(x).strip())
-
-    def get_all_nodes(self) -> Set[str]:
-        nodes = set()
-        if 'Nodes' in self.df_dict:
-            df = self.df_dict['Nodes']
-            for col in ['EnglishName','ChineseName','Name','Node','NodeName']:
-                if col in df.columns:
-                    for v in df[col]:
-                        n = self.norm_name(v)
-                        if n: nodes.add(n)
-        for sheet, df in self.df_dict.items():
-            if 'arc' in sheet.lower():
-                for col in ['OriginEN','DestEN','Origin','Destination','From','To']:
-                    if col in df.columns:
-                        for v in df[col]:
-                            n = self.norm_name(v)
-                            if n: nodes.add(n)
-        nodes |= SEA_PORTS_CN | SEA_PORTS_EU
-        return nodes
-
-    def load_nodes(self) -> Dict[str, dict]:
-        nodes: Dict[str, dict] = {}
-        if 'Nodes' in self.df_dict:
-            df = self.df_dict['Nodes']
-            for _, row in df.iterrows():
-                name = None
-                for c in ['EnglishName','Name','NodeName','Node']:
-                    if c in df.columns:
-                        name = self.norm_name(row[c]); 
-                        if name: break
-                if not name: continue
-                region = self.norm_name(row.get('Region','CN')) or 'CN'
-                cap = float(row.get('NodeCap_TEUh', 1e6)) if 'NodeCap_TEUh' in df.columns and not pd.isna(row.get('NodeCap_TEUh')) else 1e6
-                nodes[name] = {'region': region, 'capacity': cap}
-        for p in (SEA_PORTS_CN | SEA_PORTS_EU):
-            nodes.setdefault(p, {'region': ('CN' if p in SEA_PORTS_CN else 'WE'), 'capacity': 1e6})
-        border_kw = ['Khorgos','Alashankou','Erenhot','Manzhouli','Zabaikalsk','Brest','Malaszewicze','Małaszewicze']
-        for n in list(nodes.keys()):
-            nodes[n]['is_border'] = any(kw.lower() in n.lower() for kw in border_kw)
-            nodes[n]['is_port'] = (n in SEA_PORTS_CN) or (n in SEA_PORTS_EU)
-        print(f"节点数: {len(nodes)}")
-        return nodes
-
-    def _colkey(self, s: str) -> str:
-        return re.sub(r'[^a-z0-9]', '', s.strip().lower())
-
-    def load_arcs(self) -> Dict[Tuple[str, str], dict]:
-        """支持：宽表 Origin/Destination + Road/Rail/Sea 距离；长表 Origin/Destination/Mode/Distance"""
-        arcs: Dict[Tuple[str, str], dict] = {}
-        arc_sheets = [s for s in self.df_dict.keys() if 'arc' in s.lower()]
-        if not arc_sheets and 'Arcs_All' in self.df_dict:
-            arc_sheets = ['Arcs_All']
-
-        def mode_from_str(x: str) -> Optional[Mode]:
-            s = self._colkey(str(x))
-            if s in ('1','road','truck','highway','roadkm','roadkms','roaddistance'): return Mode.ROAD
-            if s in ('2','rail','train','railkm','railkms','raildistance'): return Mode.RAIL
-            if s in ('3','sea','water','ship','waterkm','seakm','seadistance','waterdistance','waterway'): return Mode.WATER
-            if 'rail' in s: return Mode.RAIL
-            if 'road' in s or 'truck' in s or 'highway' in s: return Mode.ROAD
-            if 'sea' in s or 'water' in s or 'ship' in s: return Mode.WATER
-            return None
-
-        for sheet in arc_sheets:
-            df = self.df_dict[sheet]
-            cols = {c:self._colkey(c) for c in df.columns}
-            inv = defaultdict(list)
-            for c,nc in cols.items(): inv[nc].append(c)
-
-            ocol = next((inv[k][0] for k in ['originen','origin','from','o','source','o_en','fromen','orig'] if k in inv), None)
-            dcol = next((inv[k][0] for k in ['desten','destination','dest','to','d','target','d_en','toen'] if k in inv), None)
-            if not ocol or not dcol:
-                continue
-
-            # 宽表列检测
-            dist_cols_wide: List[Tuple[str, Mode]] = []
-            for c in df.columns:
-                key = self._colkey(c)
-                if any(x in key for x in ['km','kms','distance','dist']):
-                    m = None
-                    if 'rail' in key: m = Mode.RAIL
-                    elif ('road' in key or 'truck' in key or 'highway' in key): m = Mode.ROAD
-                    elif ('sea' in key or 'water' in key or 'ship' in key or 'waterway' in key): m = Mode.WATER
-                    if m is not None:
-                        dist_cols_wide.append((c, m))
-
-            if dist_cols_wide:
-                for _, row in df.iterrows():
-                    o = self.norm_name(row.get(ocol, '')); d = self.norm_name(row.get(dcol, ''))
-                    if not o or not d: continue
-                    key = (o, d)
-                    arcs.setdefault(key, {'distances':{}, 'modes':[]})
-                    for col, m in dist_cols_wide:
-                        val = pd.to_numeric(row.get(col, None), errors='coerce')
-                        if pd.notna(val) and float(val) > 0:
-                            arcs[key]['distances'][m] = float(val)
-                            if m not in arcs[key]['modes']: arcs[key]['modes'].append(m)
-                continue
-
-            # 长表
-            mode_col = next((inv[k][0] for k in ['mode','transportmode','modetype','m'] if k in inv), None)
-            dist_col = next((inv[k][0] for k in ['distance','dist','km','kms','length','len'] if k in inv), None)
-            if mode_col and dist_col:
-                for _, row in df.iterrows():
-                    o = self.norm_name(row.get(ocol, '')); d = self.norm_name(row.get(dcol, ''))
-                    if not o or not d: continue
-                    m = mode_from_str(str(row.get(mode_col,'')))
-                    if m is None: continue
-                    val = pd.to_numeric(row.get(dist_col, None), errors='coerce')
-                    if pd.notna(val) and float(val) > 0:
-                        key = (o,d)
-                        arcs.setdefault(key, {'distances':{}, 'modes':[]})
-                        arcs[key]['distances'][m] = float(val)
-                        if m not in arcs[key]['modes']: arcs[key]['modes'].append(m)
-
-        print(f"弧段数: {len(arcs)}")
-        return arcs
-
-    def load_schedules(self) -> Dict[Tuple[str, str, Mode], float]:
-        """Timetable 频次→周内间隔；生成每周固定槽位"""
-        schedules = {}
-        if 'Timetable' in self.df_dict:
-            df = self.df_dict['Timetable']
-            for _, row in df.iterrows():
-                o = self.norm_name(row.get('OriginEN','')); d = self.norm_name(row.get('DestEN',''))
-                if not o or not d: continue
-                mode_str = str(row.get('Mode','')).strip().upper()
-                freq = self._parse_freq(str(row.get('Frequency_per_week','1')))
-                if freq and freq > 0:
-                    headway = 168.0 / freq
-                    if 'RAIL' in mode_str or mode_str == '2':
-                        schedules[(o,d,Mode.RAIL)] = headway
-                    elif 'WATER' in mode_str or mode_str == '3':
-                        schedules[(o,d,Mode.WATER)] = headway
-                    else:
-                        schedules[(o,d,Mode.RAIL)]  = headway
-                        schedules[(o,d,Mode.WATER)] = headway
-        print(f"班期条数: {len(schedules)}")
-        return schedules
-
-    @staticmethod
-    def _parse_freq(s: str) -> Optional[float]:
-        s = s.lower()
-        if 'daily' in s or '每天' in s: return 7.0
-        if 'weekly' in s or '每周' in s: return 1.0
-        if 'biweekly' in s: return 0.5
-        nums = re.findall(r'\d+(?:\.\d+)?', s)
-        return float(nums[0]) if nums else None
-
-    def ensure_sea_connectivity(self, nodes, arcs, params):
-        """注入海运骨干与典型接驳，兜底连通性"""
-        sea_pairs_km = {
-            ("Shanghai","Hamburg"): 20300, ("Shanghai","Rotterdam"): 19600, ("Shanghai","Antwerp"): 19850,
-            ("Ningbo","Hamburg"): 19900, ("Qingdao","Hamburg"): 18800, ("Tianjin","Hamburg"): 19700,
-            ("Shenzhen","Hamburg"): 20800, ("Xiamen","Hamburg"): 20500,
-            ("Shanghai","Piraeus"): 17600, ("Ningbo","Piraeus"): 17200, ("Shenzhen","Piraeus"): 18100,
-        }
-        for (o,d),dist in sea_pairs_km.items():
-            if o in nodes and d in nodes:
-                for key in [(o,d),(d,o)]:
-                    arcs.setdefault(key, {'distances':{}, 'modes':[]})
-                    arcs[key]['distances'][Mode.WATER] = float(dist)
-                    if Mode.WATER not in arcs[key]['modes']:
-                        arcs[key]['modes'].append(Mode.WATER)
-                params.S_jm.setdefault((o, Mode.WATER), [0.0])
-
-        feeder_cn = {
-            "Chongqing": {"Shanghai":1700, "Shenzhen":1600},
-            "Zhengzhou": {"Qingdao":850, "Shanghai":1000},
-            "Wuhan": {"Shanghai":900, "Shenzhen":1000},
-            "Xi'an": {"Qingdao":1500, "Shanghai":1600},
-        }
-        for i, dmap in feeder_cn.items():
-            if i not in nodes: continue
-            for j, dist in dmap.items():
-                if j in nodes:
-                    arcs.setdefault((i,j), {'distances':{}, 'modes':[]})
-                    arcs[(i,j)]['distances'][Mode.RAIL] = float(dist)
-                    if Mode.RAIL not in arcs[(i,j)]['modes']:
-                        arcs[(i,j)]['modes'].append(Mode.RAIL)
-
-        feeder_eu_rail = {
-            "Hamburg": {"Berlin":290, "Duisburg":380, "Munich":790},
-            "Rotterdam": {"Duisburg":230, "Berlin":680},
-            "Antwerp": {"Duisburg":220},
-        }
-        for i, dmap in feeder_eu_rail.items():
-            if i not in nodes: continue
-            for j, dist in dmap.items():
-                if j in nodes:
-                    arcs.setdefault((i,j), {'distances':{}, 'modes':[]})
-                    arcs[(i,j)]['distances'][Mode.RAIL] = float(dist)
-                    if Mode.RAIL not in arcs[(i,j)]['modes']:
-                        arcs[(i,j)]['modes'].append(Mode.RAIL)
-
-    def _default_params(self, nodes) -> NetworkParameters:
-        """Excel 缺省时的默认参数"""
-        p = NetworkParameters()
-        p.V_m = {Mode.ROAD: 45.0, Mode.RAIL: 40.0, Mode.WATER: 32.0}
-        p.CT_r = {'CN': 10.0, 'CA': 15.0, 'RU': 5.0, 'EE': 20.0, 'WE': 25.0}
-        for m in Mode:
-            for r in ['CN','CA','RU','EE','WE']:
-                p.E_mr[(m, r)] = {Mode.ROAD:0.09, Mode.RAIL:0.02, Mode.WATER:0.012}[m]
-                p.Theta_rm[(r, m)] = 1.0
-        base_tt = {
-            (Mode.ROAD,Mode.RAIL):2.0,(Mode.ROAD,Mode.WATER):3.0,
-            (Mode.RAIL,Mode.ROAD):2.0,(Mode.RAIL,Mode.WATER):4.0,
-            (Mode.WATER,Mode.ROAD):3.0,(Mode.WATER,Mode.RAIL):4.0
-        }
-        for j in self.get_all_nodes():
-            for (m1,m2),tt in base_tt.items():
-                if m1==m2: continue
-                p.TT_jmn[(j,m1,m2)] = tt
-                p.TC_jmn[(j,m1,m2)] = 50.0
-        for k in range(1, 2000):
-            p.P_k[k] = 20.0
-        return p
-
-    def build(self) -> Tuple[NetworkParameters, dict]:
-        self.read_all()
-        nodes = self.load_nodes()
-        arcs = self.load_arcs()
-        schedules = self.load_schedules()
-        params = self._default_params(nodes)
-
-        # 区域&能力
-        for n, v in nodes.items():
-            params.rho[n] = v['region']
-            params.CAP_node[n] = v['capacity']
-            params.B_j[n] = v.get('is_border', False)
-            params.BD_j.setdefault(n, 6.0 if v.get('is_border', False) else 0.0)
-            params.CC_j.setdefault(n, 4.0 if v.get('is_port', False) else 0.0)
-            params.W_proc.setdefault(n, 5.0)
-            params.W_hold.setdefault(n, 2.0)
-
-        # 成本系数兜底
-        for (o,d), data in arcs.items():
-            for m, dist in data.get('distances', {}).items():
-                params.C_ijm.setdefault((o,d,m), {Mode.ROAD:3.2, Mode.RAIL:1.0, Mode.WATER:0.6}[m])
-
-        # Timetable → 周内槽位
-        for (o,d,m), headway in schedules.items():
-            t = 0.0
-            li = params.S_jm.get((o,m), [])
-            while t < 168.0:
-                li.append(round(t, 6)); t += headway
-            params.S_jm[(o,m)] = sorted(set(li))
-
-        # 海运/接驳
-        self.ensure_sea_connectivity(nodes, arcs, params)
-
-        # arc_id 表
-        arc_table: Dict[int, Tuple[str, str, int, float]] = {}
-        arc_index: Dict[Tuple[str, str, int], int] = {}
-        next_id = 0
-        for (o,d), data in arcs.items():
-            for m in data.get('modes', []):
-                dist = data['distances'].get(m, None)
-                if dist is None or dist <= 0: continue
-                arc_table[next_id] = (o, d, int(m), float(dist))
-                arc_index[(o, d, int(m))] = next_id
-                next_id += 1
-        print(f"arc_table 条数: {len(arc_table)}")
-
-        # 弧-模态容量（周累计）
-        arc_capacity_abs = {}
-        for aid, (i,j,m,_) in arc_table.items():
-            cap = min(params.CAP_node.get(i, 1e6), params.CAP_node.get(j, 1e6)) * 168.0
-            arc_capacity_abs[((i,j), m)] = cap
-
-        network = {
-            'nodes': nodes,
-            'arcs_raw': arcs,
-            'arc_table': arc_table,
-            'arc_index': arc_index,
-            'schedules': schedules,
-            'arc_capacity_abs': arc_capacity_abs
-        }
-        return params, network
+# Excel 数据读取
 
 
-模型与目标
+def load_network_from_extended(filename: str):
+    """
+    从 extended.xlsx 中读取 Nodes, Arcs_All, Timetable, Batches。
+    """
+    xls = pd.ExcelFile(filename)
 
+    # Nodes
+    if "Nodes" not in xls.sheet_names:
+        raise ValueError("extended.xlsx 中必须包含 Nodes 表")
+    nodes_df = pd.read_excel(xls, "Nodes")
+    for c in ["EnglishName", "Region"]:
+        if c not in nodes_df.columns:
+            raise ValueError(f"Nodes 表中缺少列: {c}")
 
-class MultimodalOptimizationModel:
-    def __init__(self, params: NetworkParameters, network: dict, batches: List[Batch]):
-        self.params = params
-        self.network = network
-        self.batches = batches
+    node_names = nodes_df["EnglishName"].astype(str).tolist()
+    node_region = dict(
+        zip(
+            nodes_df["EnglishName"].astype(str),
+            nodes_df["Region"].astype(str),
+        )
+    )
 
-    def determine_transshipment_volumes(self, dv: DecisionVariables) -> Dict:
-        """根据入/出流推断 y_jmnk（用于转运成本）"""
-        y = {}
-        per_node_in = defaultdict(lambda: defaultdict(float))
-        per_node_out = defaultdict(lambda: defaultdict(float))
-        for (i,j,m,k), f in dv.f_ijmk.items():
-            per_node_in[(j,k)][m] += f
-            per_node_out[(i,k)][m] += f
-        for (j,k), dm_in in per_node_in.items():
-            dm_out = per_node_out.get((j,k), {})
-            for m in Mode:
-                for n in Mode:
-                    if m == n: continue
-                    v = min(dm_in.get(m,0.0), dm_out.get(n,0.0))
-                    if v > 0:
-                        y[(j,m,n,k)] = v
-        return y
+    # Arcs_All
+    if "Arcs_All" not in xls.sheet_names:
+        raise ValueError("extended.xlsx 中必须包含 Arcs_All 表")
+    arcs_df = pd.read_excel(xls, "Arcs_All")
+    required_arc_cols = [
+        "OriginEN", "DestEN", "Mode",
+        "Distance_km", "Cost_$_per_km", "Emission_gCO2_per_tkm"
+    ]
+    for c in required_arc_cols:
+        if c not in arcs_df.columns:
+            raise ValueError(f"Arcs_All 表中缺少列: {c}")
 
-    def objective_cost(self, dv: DecisionVariables, aux: AuxiliaryVariables) -> float:
-        """运输+碳税+转运+等待+迟到"""
-        p = self.params
-        total = 0.0
-        for (i,j,m,k), f in dv.f_ijmk.items():
-            dist = self.network['arcs_raw'].get((i,j), {}).get('distances', {}).get(m, 0.0)
-            unit_cost = p.C_ijm.get((i,j,m), 1.5)
-            total += unit_cost * dist * f
-            region = p.rho.get(i, 'CN')
-            ct = p.CT_r.get(region, 10.0)
-            theta = p.Theta_rm.get((region, m), 1.0)
-            ef = p.E_mr.get((m, region), 0.05)
-            total += ct * theta * ef * dist * f
+    has_cap_col = "Capacity_TEU" in arcs_df.columns
 
-        for (j,m,n,k), y in aux.y_jmnk.items():
-            if m != n:
-                total += p.TC_jmn.get((j,m,n), 50.0) * y
+    arcs: List[Arc] = []
+    for _, row in arcs_df.iterrows():
+        mode_raw = str(row["Mode"]).strip().lower()
+        if mode_raw == "rail":
+            mode = "rail"
+            speed = 50.0
+        elif mode_raw == "road":
+            mode = "road"
+            speed = 75.0
+        elif mode_raw == "water":
+            mode = "water"
+            speed = 30.0
+        else:
+            mode = mode_raw
+            speed = 50.0
 
-        for (j,k), t_wait in aux.w_jk.items():
-            inflow = sum(
-                dv.f_ijmk.get((i,j,m,k), 0.0)
-                for (i2,j2,m2,k2), f in dv.f_ijmk.items()
-                if j2 == j and k2 == k
+        dist_str = str(row["Distance_km"])
+        cleaned = "".join(ch for ch in dist_str if (ch.isdigit() or ch == "."))
+        distance = float(cleaned) if cleaned else 0.0
+
+        cost = float(row["Cost_$_per_km"])
+        emis = float(row["Emission_gCO2_per_tkm"])
+
+        if has_cap_col and not pd.isna(row["Capacity_TEU"]):
+            capacity = float(row["Capacity_TEU"])
+        else:
+            capacity = 1e9
+
+        arcs.append(
+            Arc(
+                from_node=str(row["OriginEN"]).strip(),
+                to_node=str(row["DestEN"]).strip(),
+                mode=mode,
+                distance=distance,
+                capacity=capacity,
+                cost_per_teu_km=cost,
+                emission_per_teu_km=emis,
+                speed_kmh=speed,
             )
-            total += p.W_hold.get(j, 2.0) * inflow * max(0.0, t_wait)
+        )
 
-        for b in self.batches:
-            delta = aux.delta_k.get(b.id, 0.0)
-            total += p.P_k.get(b.id, 20.0) * b.Q_k * max(0.0, delta)
-        return total
+    # Timetable
+    if "Timetable" not in xls.sheet_names:
+        raise ValueError("extended.xlsx 中必须包含 Timetable 表")
+    tdf = pd.read_excel(xls, "Timetable")
+    required_tt_cols = [
+        "OriginEN", "DestEN", "Mode",
+        "Frequency_per_week", "FirstDepartureHour", "Headway_Hours"
+    ]
+    for c in required_tt_cols:
+        if c not in tdf.columns:
+            raise ValueError(f"Timetable 表中缺少列: {c}")
 
-    def objective_emission(self, dv: DecisionVariables) -> float:
-        p = self.params
-        total = 0.0
-        for (i,j,m,k), f in dv.f_ijmk.items():
-            dist = self.network['arcs_raw'].get((i,j), {}).get('distances', {}).get(m, 0.0)
-            region = p.rho.get(i, 'CN')
-            ef = p.E_mr.get((m, region), 0.05)
-            total += ef * dist * f
-        return total
-
-    @staticmethod
-    def objective_makespan(aux: AuxiliaryVariables) -> float:
-        return aux.t_max
-
-
-路径库
-
-
-def build_path_library(network: dict, ODs: List[Tuple[str,str]], k: int = 8) -> Dict[Tuple[str,str], List[List[int]]]:
-    arc_table = network['arc_table']
-    adj: Dict[str, List[Tuple[str,int]]] = defaultdict(list)
-    for aid, (i,j,m,_) in arc_table.items():
-        adj[i].append((j, aid))
-
-    library: Dict[Tuple[str,str], List[List[int]]] = {}
-    for (O, D) in ODs:
-        paths: List[Tuple[List[int], float]] = []
-        q = deque([(O, [], 0.0, 0)])
-        visited = set()
-        while q and len(paths) < k * 3:
-            cur, seq, cost, depth = q.popleft()
-            if cur == D and seq:
-                paths.append((seq, cost)); continue
-            if depth > 10: continue
-            key = (cur, tuple(seq[-4:]))
-            if key in visited: continue
-            visited.add(key)
-            for (nxt, aid) in adj.get(cur, []):
-                i,j,m,dist = arc_table[aid]
-                if len(seq) >= 1:
-                    prev_i, prev_j, _, _ = arc_table[seq[-1]]
-                    if j == prev_i and i == prev_j:
-                        continue
-                q.append((nxt, seq+[aid], cost+dist, depth+1))
-        paths.sort(key=lambda x: x[1])
-        library[(O,D)] = [seq for seq,_ in paths[:k]]
-    return library
-
-
-解码（容量/班期/处理 无路惩罚）
-
-
-def decode_to_dv_aux(
-    ch: Chromosome,
-    model: MultimodalOptimizationModel,
-    path_library: Dict[Tuple[str,str], List[List[int]]],
-    priority_factor_map: Dict[int, float] = {1:1.15, 2:1.0, 3:0.9},
-):
-    params = model.params; net = model.network
-    arc_table = net['arc_table']
-    residual_cap = dict(net['arc_capacity_abs'])
-
-    dv = DecisionVariables()
-    aux = AuxiliaryVariables()
-    aux.w_jk = defaultdict(float); aux.a_jk = {}
-
-    selector = FlowAwarePathSelector(net, net['arc_capacity_abs'])
-
-    for b in model.batches:
-        O, D = b.O_k, b.DEST_k
-        key_od = (O, D)
-        chosen_ids = ch.route_ids.get(key_od, [])
-        no_path_penalty = False
-
-        if not chosen_ids:
-            no_path_penalty = True
+    timetables: List[TimetableEntry] = []
+    for _, row in tdf.iterrows():
+        mode_raw = str(row["Mode"]).strip().lower()
+        if mode_raw == "rail":
+            mode = "rail"
+        elif mode_raw == "road":
+            mode = "road"
+        elif mode_raw == "water":
+            mode = "water"
         else:
-            scored = []
-            for local_idx, path_idx in enumerate(chosen_ids):
-                if path_idx >= len(path_library.get(key_od, [])): continue
-                path_arcs = path_library[key_od][path_idx]
-                if not path_arcs: continue
-                score = selector.score_path(path_arcs)
-                scored.append((local_idx, path_idx, score, path_arcs))
-            if not scored:
-                no_path_penalty = True
+            mode = mode_raw
+
+        freq = float(row["Frequency_per_week"])
+
+        v = row["FirstDepartureHour"]
+        if pd.isna(v):
+            fd = 0.0
+        else:
+            s = str(v)
+            if ":" in s:
+                try:
+                    fd = float(s.split(":")[0])
+                except Exception:
+                    fd = 0.0
             else:
-                scored.sort(key=lambda x: x[2])
-                ratios = ch.batch_ratios.get((O,D,b.id), [1.0/len(scored)]*len(scored))
-                if len(ratios) < len(scored):
-                    ratios = (ratios + [0.0]*(len(scored)-len(ratios)))
-                srat = sum(max(0.0, r) for r in ratios)
-                ratios = [max(0.0, r)/srat for r in ratios] if srat>0 else [1.0/len(scored)]*len(scored)
+                fd = float(s)
 
-                pri = ch.priority.get(b.id, 2)
-                pri_factor = priority_factor_map.get(pri, 1.0)
-
-                target_total = b.Q_k * pri_factor
-                remain_total = target_total
-                alloc_abs = [target_total * r for r in ratios]
-                pushed_abs = [0.0]*len(scored)
-
-                # 第一轮推进（受最小剩余容量限制）
-                for idx, (_, path_idx, _, path_arcs) in enumerate(scored):
-                    need = min(alloc_abs[idx], remain_total)
-                    if need <= 1e-9: continue
-                    path_min_res = float('inf')
-                    for aid in path_arcs:
-                        i,j,m,dist = arc_table[aid]
-                        path_min_res = min(path_min_res, residual_cap[((i,j), m)])
-                    push = max(0.0, min(need, path_min_res))
-                    if push > 0:
-                        for aid in path_arcs:
-                            i,j,m,dist = arc_table[aid]
-                            residual_cap[((i,j), m)] -= push
-                            selector.update_flow(i,j,m,push)
-                            dv.f_ijmk[(i,j,Mode(m), b.id)] = dv.f_ijmk.get((i,j,Mode(m), b.id), 0.0) + push
-                            dv.z_ijmk[(i,j,Mode(m), b.id)] = 1.0
-                        pushed_abs[idx] += push
-                        remain_total -= push
-
-                # 第二轮回填
-                if remain_total > 1e-6:
-                    for idx, (_, path_idx, _, path_arcs) in enumerate(scored):
-                        if remain_total <= 1e-9: break
-                        path_min_res = float('inf')
-                        for aid in path_arcs:
-                            i,j,m,dist = arc_table[aid]
-                            path_min_res = min(path_min_res, residual_cap[((i,j), m)])
-                        push = max(0.0, min(remain_total, path_min_res))
-                        if push <= 1e-9: continue
-                        for aid in path_arcs:
-                            i,j,m,dist = arc_table[aid]
-                            residual_cap[((i,j), m)] -= push
-                            selector.update_flow(i,j,m,push)
-                            dv.f_ijmk[(i,j,Mode(m), b.id)] = dv.f_ijmk.get((i,j,Mode(m), b.id), 0.0) + push
-                            dv.z_ijmk[(i,j,Mode(m), b.id)] = 1.0
-                        pushed_abs[idx] += push
-                        remain_total -= push
-
-                # 时间推进（取最早到达的一条）
-                best_arrival = None
-                total_wait = 0.0
-                phase = float(ch.dep_phase.get(b.id, 0.0)) % 168.0
-
-                for local_idx, (_, path_idx, _, path_arcs) in enumerate(scored):
-                    if pushed_abs[local_idx] <= 1e-9: 
-                        continue
-                    t = phase
-                    last_mode = None
-                    path_wait = 0.0
-                    for step_idx, aid in enumerate(path_arcs):
-                        i,j,m,dist = arc_table[aid]
-                        t_ready = t + params.W_proc.get(i,5.0)
-                        if params.B_j.get(i, False): t_ready += params.BD_j.get(i, 6.0)
-                        if model.network['nodes'].get(i,{}).get('is_port', False): 
-                            t_ready += params.CC_j.get(i, 4.0)
-                        if last_mode is not None and last_mode != Mode(m):
-                            t_ready += params.TT_jmn.get((i, last_mode, Mode(m)), 0.0)
-                        dep = t_ready
-                        sched = params.S_jm.get((i, Mode(m)), None)
-                        if sched and Mode(m) in (Mode.RAIL, Mode.WATER):
-                            r = t_ready % 168.0
-                            shift = ch.dep_index_shift.get((b.id, local_idx), 0)
-                            idx2 = None
-                            for s in sched:
-                                if s >= r:
-                                    idx2 = sched.index(s)
-                                    break
-                            if idx2 is None:
-                                dep = t_ready - r + sched[0] + 168.0
-                            else:
-                                idx2 = max(0, min(len(sched)-1, idx2 + shift))
-                                dep = t_ready - r + sched[idx2]
-                                if dep < t_ready: dep += 168.0
-                            path_wait += max(0.0, dep - t_ready)
-                        v = params.V_m.get(Mode(m), 40.0)
-                        travel = dist / max(1e-6, v)
-                        t = dep + travel
-                        last_mode = Mode(m)
-                    if best_arrival is None or t < best_arrival:
-                        best_arrival = t
-                        total_wait = path_wait
-
-                if best_arrival is None:
-                    no_path_penalty = True
-                else:
-                    aux.a_jk[(D, b.id)] = best_arrival
-                    aux.w_jk[(D, b.id)] = total_wait
-                    aux.delta_k[b.id] = max(0.0, best_arrival - b.LT_k)
-                    aux.t_max = max(aux.t_max, best_arrival)
-
-        # 无路/失败：强制大延误（防止目标为0）
-        if key_od not in ch.route_ids or not ch.route_ids[key_od] or no_path_penalty:
-            huge = b.LT_k + 1e5
-            aux.a_jk[(D, b.id)] = huge
-            aux.w_jk[(D, b.id)] = 0.0
-            aux.delta_k[b.id] = max(0.0, huge - b.LT_k)
-            aux.t_max = max(aux.t_max, huge)
-
-    aux.y_jmnk = model.determine_transshipment_volumes(dv)
-    return dv, aux
-
-
-#上层
-
-
-class ClassicNSGA2:
-    def __init__(self, model, batches, path_library,
-                 pop_size=40, n_generations=60, crossover_prob=0.9,
-                 mutation_prob=0.3, max_paths_per_od=3):
-        self.model = model
-        self.batches = batches
-        self.path_library = path_library
-        self.pop_size = pop_size
-        self.n_generations = n_generations
-        self.crossover_prob = crossover_prob
-        self.mutation_prob = mutation_prob
-        self.max_paths_per_od = max_paths_per_od
-
-        arc_cap_abs = model.network['arc_capacity_abs']
-        self.selector = FlowAwarePathSelector(model.network, arc_cap_abs)
-        self.memory = SolutionMemory(max_size=pop_size * 20)
-
-    # ----- 染色体工具 -----
-    def init_population(self) -> List[Chromosome]:
-        pop: List[Chromosome] = []
-        ODs = sorted(set((b.O_k, b.DEST_k) for b in self.batches))
-        for _ in range(self.pop_size):
-            ch = Chromosome()
-            for od in ODs:
-                cands = self.path_library.get(od, [])
-                if cands:
-                    sel = self.selector.select(od, self.path_library, self.max_paths_per_od)
-                    if not sel: sel = [0]
-                    ch.route_ids[od] = sel[:self.max_paths_per_od]
-            for b in self.batches:
-                od = (b.O_k, b.DEST_k)
-                m = len(ch.route_ids.get(od, []))
-                if m == 0:
-                    continue
-                ch.batch_ratios[(od[0], od[1], b.id)] = [1.0/m]*m
-                ch.dep_phase[b.id] = random.uniform(0, 168.0)
-                ch.priority[b.id] = random.randint(1, 3)
-            pop.append(ch)
-        return pop
-
-    def evaluate(self, ch: Chromosome) -> Tuple[float,float,float]:
-        ch_key = ch.to_dict()
-        cached = self.memory.get(ch_key)
-        if cached is not None:
-            return cached
-        dv, aux = decode_to_dv_aux(ch, self.model, self.path_library)
-        cost = self.model.objective_cost(dv, aux)
-        emis = self.model.objective_emission(dv)
-        mak = self.model.objective_makespan(aux)
-        objs = (cost, emis, mak)
-        self.memory.put(ch_key, objs, dv, aux)
-        return objs
-
-    def _fit_ratio_len(self, r: List[float], m: int) -> List[float]:
-        if m <= 0: return []
-        if len(r) == m:
-            s = sum(r); return [x/s for x in r] if s>0 else [1.0/m]*m
-        if len(r) > m:
-            r2 = r[:m]; s = sum(r2); return [x/s for x in r2] if s>0 else [1.0/m]*m
-        need = m - len(r)
-        r2 = r + [0.0]*need
-        s = sum(r2)
-        return [x/s for x in r2] if s>0 else [1.0/m]*m
-
-    def crossover(self, p1: Chromosome, p2: Chromosome) -> Tuple[Chromosome, Chromosome]:
-        c1, c2 = copy.deepcopy(p1), copy.deepcopy(p2)
-        if random.random() < self.crossover_prob:
-            ods = list(set(list(p1.route_ids.keys()) + list(p2.route_ids.keys())))
-            for od in ods:
-                if random.random() < 0.5 and od in p1.route_ids and od in p2.route_ids:
-                    c1.route_ids[od], c2.route_ids[od] = c2.route_ids[od], c1.route_ids[od]
-            for b in self.batches:
-                od = (b.O_k, b.DEST_k)
-                if od in c1.route_ids:
-                    m1 = len(c1.route_ids[od])
-                    c1.batch_ratios[(od[0],od[1],b.id)] = self._fit_ratio_len(c1.batch_ratios.get((od[0],od[1],b.id), []), m1)
-                if od in c2.route_ids:
-                    m2 = len(c2.route_ids[od])
-                    c2.batch_ratios[(od[0],od[1],b.id)] = self._fit_ratio_len(c2.batch_ratios.get((od[0],od[1],b.id), []), m2)
-            for b in self.batches:
-                if random.random() < 0.5:
-                    c1.dep_phase[b.id], c2.dep_phase[b.id] = c2.dep_phase.get(b.id,0.0), c1.dep_phase.get(b.id,0.0)
-                if random.random() < 0.5:
-                    c1.priority[b.id], c2.priority[b.id] = c2.priority.get(b.id,2), c1.priority.get(b.id,2)
-        return c1, c2
-
-    def mutate(self, ch: Chromosome) -> Chromosome:
-        m = copy.deepcopy(ch)
-        if random.random() < self.mutation_prob:
-            if m.route_ids and random.random() < 0.4:
-                od = random.choice(list(m.route_ids.keys()))
-                sel = self.selector.select(od, self.path_library, self.max_paths_per_od)
-                if sel:
-                    m.route_ids[od] = sel[:self.max_paths_per_od]
-                    for b in self.batches:
-                        key = (od[0], od[1], b.id)
-                        if key in m.batch_ratios:
-                            m.batch_ratios[key] = self._fit_ratio_len(m.batch_ratios[key], len(m.route_ids[od]))
-            if random.random() < 0.4 and m.batch_ratios:
-                key = random.choice(list(m.batch_ratios.keys()))
-                r = m.batch_ratios[key]
-                if len(r) >= 2:
-                    i = random.randrange(len(r))
-                    delta = random.uniform(-0.2, 0.2)
-                    r[i] = max(0.05, min(0.95, r[i] + delta))
-                    s = sum(r); m.batch_ratios[key] = [x/s for x in r]
-            if random.random() < 0.3 and m.dep_phase:
-                bid = random.choice(list(m.dep_phase.keys()))
-                m.dep_phase[bid] = max(0.0, min(168.0, m.dep_phase[bid] + random.uniform(-24, 24)))
-            if random.random() < 0.2 and m.route_ids:
-                b = random.choice(self.batches)
-                od = (b.O_k, b.DEST_k)
-                if od in m.route_ids and len(m.route_ids[od])>0:
-                    lidx = random.randrange(len(m.route_ids[od]))
-                    m.dep_index_shift[(b.id, lidx)] = random.choice([-1,0,1])
-            if random.random() < 0.2 and m.priority:
-                bid = random.choice(list(m.priority.keys()))
-                m.priority[bid] = random.randint(1,3)
-        return m
-
-    # ----- NSGA-II 组件 -----
-    @staticmethod
-    def dominates(o1, o2) -> bool:
-        better = False
-        for i in range(3):
-            if o1[i] > o2[i]:
-                return False
-            if o1[i] < o2[i]:
-                better = True
-        return better
-
-    def fast_non_dominated_sort(self, objs):
-        n = len(objs)
-        S = [[] for _ in range(n)]
-        n_dom = [0]*n
-        fronts = [[]]
-        for p in range(n):
-            for q in range(n):
-                if p == q: continue
-                if self.dominates(objs[p], objs[q]):
-                    S[p].append(q)
-                elif self.dominates(objs[q], objs[p]):
-                    n_dom[p] += 1
-            if n_dom[p] == 0:
-                fronts[0].append(p)
-        i = 0
-        while fronts[i]:
-            nxt = []
-            for p in fronts[i]:
-                for q in S[p]:
-                    n_dom[q] -= 1
-                    if n_dom[q] == 0:
-                        nxt.append(q)
-            i += 1
-            fronts.append(nxt)
-        return [f for f in fronts if f]
-
-    @staticmethod
-    def crowding_distance(front_indices, objs):
-        if not front_indices: return {}
-        dist = {i:0.0 for i in front_indices}
-        for m in range(3):
-            order = sorted(front_indices, key=lambda idx: objs[idx][m])
-            dist[order[0]] = float('inf')
-            dist[order[-1]] = float('inf')
-            minv = objs[order[0]][m]; maxv = objs[order[-1]][m]
-            if abs(maxv - minv) < 1e-12: continue
-            for j in range(1, len(order)-1):
-                prev_val = objs[order[j-1]][m]
-                next_val = objs[order[j+1]][m]
-                dist[order[j]] += (next_val - prev_val) / (maxv - minv)
-        return dist
-
-    def make_rank_and_crowding(self, population, objs):
-        fronts = self.fast_non_dominated_sort(objs)
-        rank, crowd = {}, {}
-        for r, front in enumerate(fronts):
-            cd = self.crowding_distance(front, objs)
-            for idx in front:
-                rank[idx] = r
-                crowd[idx] = cd[idx]
-        return fronts, rank, crowd
-
-    def tournament_select(self, population, rank, crowd):
-        i, j = random.randrange(len(population)), random.randrange(len(population))
-        while j == i: j = random.randrange(len(population))
-        if (rank[i] < rank[j]) or (rank[i] == rank[j] and crowd[i] > crowd[j]):
-            return copy.deepcopy(population[i])
+        hd = row["Headway_Hours"]
+        if pd.isna(hd):
+            hd = 168.0 / max(freq, 1.0)
         else:
-            return copy.deepcopy(population[j])
+            hd = float(hd)
 
-    # ----- 运行 -----
-    def run(self):
-        print("初始化种群（经典 NSGA-II）...")
-        population = self.init_population()
-        objs = [self.evaluate(ch) for ch in population]
-        fronts, rank, crowd = self.make_rank_and_crowding(population, objs)
+        timetables.append(
+            TimetableEntry(
+                from_node=str(row["OriginEN"]).strip(),
+                to_node=str(row["DestEN"]).strip(),
+                mode=mode,
+                frequency_per_week=freq,
+                first_departure_hour=fd,
+                headway_hours=hd,
+            )
+        )
 
-        for gen in range(self.n_generations):
-            # 选择
-            mating_pool = []
-            while len(mating_pool) < self.pop_size:
-                mating_pool.append(self.tournament_select(population, rank, crowd))
-            # 交叉+变异
-            offspring = []
-            for i in range(0, self.pop_size, 2):
-                p1 = mating_pool[i]
-                p2 = mating_pool[(i+1) % self.pop_size]
-                c1, c2 = self.crossover(p1, p2)
-                c1 = self.mutate(c1); c2 = self.mutate(c2)
-                offspring.append(c1); offspring.append(c2)
-            offspring = offspring[:self.pop_size]
-            offspring_objs = [self.evaluate(ch) for ch in offspring]
+    # Batches
+    if "Batches" not in xls.sheet_names:
+        raise ValueError(
+            "extended.xlsx 中必须包含 Batches 表，并包含列: "
+            "BatchID, OriginEN, DestEN, QuantityTEU, ET, LT"
+        )
+    bdf = pd.read_excel(xls, "Batches")
+    required_b_cols = ["BatchID", "OriginEN", "DestEN", "QuantityTEU", "ET", "LT"]
+    for c in required_b_cols:
+        if c not in bdf.columns:
+            raise ValueError(f"Batches 表中缺少列: {c}")
 
-            # 2N 合并 + 环境选择
-            combined = population + offspring
-            combined_objs = objs + offspring_objs
-            fronts_all = self.fast_non_dominated_sort(combined_objs)
+    batches: List[Batch] = []
+    for _, row in bdf.iterrows():
+        bid = int(row["BatchID"])
+        origin = str(row["OriginEN"]).strip()
+        dest = str(row["DestEN"]).strip()
+        qty = float(row["QuantityTEU"])
+        et = float(row["ET"])
+        lt = float(row["LT"])
+        batches.append(
+            Batch(
+                batch_id=bid,
+                origin=origin,
+                destination=dest,
+                quantity=qty,
+                ET=et,
+                LT=lt,
+            )
+        )
 
-            new_population, new_objs = [], []
-            for front in fronts_all:
-                if len(new_population) + len(front) <= self.pop_size:
-                    for idx in front:
-                        new_population.append(combined[idx])
-                        new_objs.append(combined_objs[idx])
-                else:
-                    cd = self.crowding_distance(front, combined_objs)
-                    order = sorted(front, key=lambda idx: cd[idx], reverse=True)
-                    for idx in order:
-                        if len(new_population) < self.pop_size:
-                            new_population.append(combined[idx])
-                            new_objs.append(combined_objs[idx])
-                        else:
-                            break
-                    break
-
-            population, objs = new_population, new_objs
-            fronts, rank, crowd = self.make_rank_and_crowding(population, objs)
-
-            pf_size = len(fronts[0]) if fronts else 0
-            best_c = min(o[0] for o in objs) if objs else float('inf')
-            best_e = min(o[1] for o in objs) if objs else float('inf')
-            best_t = min(o[2] for o in objs) if objs else float('inf')
-            print(f"第 {gen+1}/{self.n_generations} 代 | PF大小={pf_size} | 最优成本={best_c:,.2f} | 最优排放={best_e:.2f} | 最短工期={best_t:.2f} | 缓存={self.memory.stats()}")
-
-            if gen > self.n_generations//2:
-                self.mutation_prob = max(0.1, self.mutation_prob * 0.97)
-
-        final_front = fronts[0] if fronts else []
-        return [(population[idx], objs[idx]) for idx in final_front], self.memory
+    return node_names, arcs, timetables, batches
 
 
-报告构建
+# 路径库构建
 
 
-def _decompose_batch_paths(model: MultimodalOptimizationModel,
-                           dv: DecisionVariables,
-                           batch: Batch) -> List[Tuple[List[str], List[Mode], float]]:
-    flow = defaultdict(float)
-    for (i, j, m, k), v in dv.f_ijmk.items():
-        if k == batch.id and v > 1e-9:
-            flow[(i, j, m)] += v
+def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
+    g: Dict[str, List[Tuple[str, Arc]]] = {}
+    for a in arcs:
+        g.setdefault(a.from_node, []).append((a.to_node, a))
+    return g
 
-    def build_adj():
-        adj = defaultdict(list)
-        for (i, j, m), v in flow.items():
-            if v > 1e-9:
-                adj[i].append((j, m, v))
-        return adj
 
-    paths = []
-    while True:
-        adj = build_adj()
-        if batch.O_k not in adj:
-            break
-        best_nodes, best_modes, found = None, None, False
-        stack = [(batch.O_k, [batch.O_k], [])]
-        while stack and not found:
-            node, nodes, modes = stack.pop()
-            if node == batch.DEST_k and len(nodes) > 1:
-                best_nodes, best_modes, found = nodes, modes, True
-                break
-            for (j, m, v) in adj.get(node, []):
-                if j in nodes: continue
-                stack.append((j, nodes + [j], modes + [m]))
-        if not found:
-            break
-        min_edge = float('inf')
-        for a, b, m in zip(best_nodes[:-1], best_nodes[1:], best_modes):
-            min_edge = min(min_edge, flow[(a, b, m)])
-        if min_edge < 1e-9 or min_edge == float('inf'):
-            break
-        paths.append((best_nodes, best_modes, min_edge))
-        for a, b, m in zip(best_nodes[:-1], best_nodes[1:], best_modes):
-            flow[(a, b, m)] -= min_edge
+def random_dfs_paths(graph, origin, dest,
+                     max_len=8, max_paths=30) -> List[List[Arc]]:
+
+    paths: List[List[Arc]] = []
+
+    def dfs(node, cur):
+        if len(paths) >= max_paths or len(cur) > max_len:
+            return
+        if node == dest and cur:
+            paths.append(cur.copy())
+            return
+        for nxt, arc in graph.get(node, []):
+            if any(a.to_node == nxt for a in cur):
+                continue
+            if random.random() < 0.1:
+                continue
+            dfs(nxt, cur + [arc])
+
+    dfs(origin, [])
     return paths
 
-def build_allocation_report(model: MultimodalOptimizationModel, dv: DecisionVariables) -> str:
-    params = model.params
-    aux = AuxiliaryVariables()
-    aux.y_jmnk = model.determine_transshipment_volumes(dv)
 
-    node_throughput = defaultdict(float)
-    node_throughput_by_batch = defaultdict(float)
-    for (i, j, m, k), flow in dv.f_ijmk.items():
-        if flow > 0:
-            node_throughput[j] += flow
-            node_throughput_by_batch[(j, k)] += flow
+def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str, str], List[Path]]:
+    graph = build_graph(arcs)
+    path_lib: Dict[Tuple[str, str], List[Path]] = {}
+    next_path_id = 0
 
-    batch_node_splits = defaultdict(lambda: defaultdict(list))
-    for (j, m, n, k), y in aux.y_jmnk.items():
-        if y > 1e-9:
-            batch_node_splits[k][j].append((m, n, y))
-
-    lines = []
-    lines.append("详细分配与拆分信息")
-    lines.append("-"*80)
-    for b in model.batches:
-        lines.append(f"\n批次 {b.id}: {b.O_k} -> {b.DEST_k}, 需求={b.Q_k:.2f} TEU")
-        has_flow = any(k2 == b.id and f > 0 for (_, _, _, k2), f in dv.f_ijmk.items())
-        if not has_flow:
-            lines.append("  本批次未被分配（可能因上层组合不可行或容量冲突）")
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        if od in path_lib:
             continue
-        if b.id in batch_node_splits:
-            for j, items in batch_node_splits[b.id].items():
-                cap = params.CAP_node.get(j, float('inf'))
-                thr = node_throughput_by_batch.get((j, b.id), 0.0)
-                lines.append(f"  - 节点 {j}: 设定容量={cap:.2f} TEU/h，本批次在此通过量={thr:.2f} TEU")
-                for (m, n, y) in sorted(items, key=lambda x: -x[2]):
-                    lines.append(f"      · 转运: {Mode(m).name} → {Mode(n).name}, 量={y:.2f} TEU")
+
+        arc_paths = random_dfs_paths(graph, batch.origin, batch.destination,
+                                     max_len=8, max_paths=30)
+        paths_for_od: List[Path] = []
+
+        for arc_seq in arc_paths:
+            if not arc_seq:
+                continue
+            nodes = [arc_seq[0].from_node] + [a.to_node for a in arc_seq]
+            modes = [a.mode for a in arc_seq]
+            base_cost = sum(a.cost_per_teu_km * a.distance for a in arc_seq)
+            base_emission = sum(a.emission_per_teu_km * a.distance for a in arc_seq)
+            base_time = sum(a.distance / max(a.speed_kmh, 1.0) for a in arc_seq)
+
+            paths_for_od.append(
+                Path(
+                    path_id=next_path_id,
+                    origin=batch.origin,
+                    destination=batch.destination,
+                    nodes=nodes,
+                    modes=modes,
+                    arcs=arc_seq,
+                    base_cost_per_teu=base_cost,
+                    base_emission_per_teu=base_emission,
+                    base_travel_time_h=base_time,
+                )
+            )
+            next_path_id += 1
+
+        path_lib[od] = paths_for_od
+
+    return path_lib
+
+
+# 下层调度：时刻表 + 时间分桶容量统计
+
+
+def get_timetable_entries(timetables: List[TimetableEntry],
+                          from_node: str, to_node: str, mode: str) -> List[TimetableEntry]:
+    return [
+        t for t in timetables
+        if t.from_node == from_node and t.to_node == to_node and t.mode == mode
+    ]
+
+
+def simulate_path_with_timetable_and_capacity(path: Path,
+                                              batch: Batch,
+                                              flow_teu: float,
+                                              timetables: List[TimetableEntry],
+                                              bucket_size: float,
+                                              arc_flow_by_time: Dict[Tuple[str, str, str, int], float],
+                                              arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float]) -> float:
+    """
+    路径时间仿真，并在时间分桶上累积流量。
+    """
+    t = batch.ET
+
+    for arc in path.arcs:
+        entries = get_timetable_entries(timetables, arc.from_node, arc.to_node, arc.mode)
+
+        if not entries:
+            dep = t
         else:
-            lines.append("  本批次未发生模式转换")
+            e = entries[0]
+            fd = e.first_departure_hour
+            hd = e.headway_hours
+            if hd <= 0:
+                hd = 24.0
+            if t <= fd:
+                dep = fd
+            else:
+                n = math.ceil((t - fd) / hd)
+                dep = fd + n * hd
+            if dep < t:
+                dep = t
 
-    lines.append("\n节点总通过量（所有批次聚合）")
-    lines.append("-"*80)
-    for j, tot in sorted(node_throughput.items(), key=lambda x: -x[1]):
-        cap = params.CAP_node.get(j, float('inf'))
-        lines.append(f"  节点 {j}: 设定容量={cap:.2f} TEU/h，聚合通过量={tot:.2f} TEU")
-    return "\n".join(lines)
+        travel = arc.distance / max(arc.speed_kmh, 1.0)
+        arr = dep + travel
 
-def build_route_report(model: MultimodalOptimizationModel, dv: DecisionVariables) -> str:
-    params = model.params
-    aux = AuxiliaryVariables()
-    aux.y_jmnk = model.determine_transshipment_volumes(dv)
+        start_slot = int(dep // bucket_size)
+        end_slot = int((arr - 1e-6) // bucket_size)
+        for slot in range(start_slot, end_slot + 1):
+            key = (arc.from_node, arc.to_node, arc.mode, slot)
+            arc_flow_by_time[key] = arc_flow_by_time.get(key, 0.0) + flow_teu
 
-    batch_node_in = defaultdict(float)
-    for (i, j, m, k), v in dv.f_ijmk.items():
-        if v > 0:
-            batch_node_in[(k, j)] += v
+            user_key = (arc.from_node, arc.to_node, arc.mode, slot,
+                        batch.batch_id, path.path_id)
+            arc_slot_user_flow[user_key] = arc_slot_user_flow.get(user_key, 0.0) + flow_teu
 
-    lines = []
-    lines.append("完整路线分解（每个批次）")
-    lines.append("-"*80)
-    for b in model.batches:
-        paths = _decompose_batch_paths(model, dv, b)
-        lines.append(f"\n批次 {b.id}: {b.O_k} -> {b.DEST_k}, 需求={b.Q_k:.2f} TEU")
+        t = arr
+
+    return t - batch.ET
+
+
+def build_arc_index(arcs: List[Arc]) -> Dict[Tuple[str, str, str], Arc]:
+    return {(a.from_node, a.to_node, a.mode): a for a in arcs}
+
+
+# 适应度计算
+
+
+def evaluate_individual(ind: Individual,
+                        batches: List[Batch],
+                        path_lib: Dict[Tuple[str, str], List[Path]],
+                        arcs: List[Arc],
+                        timetables: List[TimetableEntry]):
+
+    arc_index = build_arc_index(arcs)
+    arc_flow_by_time: Dict[Tuple[str, str, str, int], float] = {}
+    arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float] = {}
+
+    total_cost = 0.0
+    total_emission = 0.0
+    makespan = 0.0
+    path_tardy: Dict[Tuple[int, int], bool] = {}
+
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        allocs = ind.od_allocations.get(od, [])
+        if not allocs:
+            total_cost += 1e10
+            total_emission += 1e10
+            makespan += 1e6
+            continue
+
+        paths_for_od = path_lib.get(od, [])
+        if not paths_for_od:
+            total_cost += 1e10
+            total_emission += 1e10
+            makespan += 1e6
+            continue
+
+        path_map = {p.path_id: p for p in paths_for_od}
+        batch_finish = 0.0
+
+        for alloc in allocs:
+            if alloc.share <= 0:
+                continue
+            if alloc.path_id not in path_map:
+                total_cost += 1e10
+                total_emission += 1e10
+                makespan += 1e6
+                continue
+
+            path = path_map[alloc.path_id]
+            flow_teu = alloc.share * batch.quantity
+
+            total_cost += path.base_cost_per_teu * flow_teu
+            total_emission += path.base_emission_per_teu * flow_teu
+
+            travel_time = simulate_path_with_timetable_and_capacity(
+                path, batch, flow_teu, timetables,
+                TIME_BUCKET_H, arc_flow_by_time, arc_slot_user_flow
+            )
+            arrival_time = batch.ET + travel_time
+            batch_finish = max(batch_finish, arrival_time)
+
+            if arrival_time > batch.LT:
+                path_tardy[(batch.batch_id, path.path_id)] = True
+
+        makespan = max(makespan, batch_finish)
+
+    capacity_violations = []
+    arc_slot_to_users: Dict[Tuple[str, str, str, int], List[Tuple[int, int, float]]] = {}
+    for (fn, tn, m, slot, bid, pid), flow in arc_slot_user_flow.items():
+        key = (fn, tn, m, slot)
+        arc_slot_to_users.setdefault(key, []).append((bid, pid, flow))
+
+    for (fn, tn, m, slot), load in arc_flow_by_time.items():
+        arc_key = (fn, tn, m)
+        if arc_key not in arc_index:
+            continue
+        arc = arc_index[arc_key]
+        cap = arc.capacity
+        if load > cap:
+            over = load - cap
+            users = arc_slot_to_users.get((fn, tn, m, slot), [])
+            capacity_violations.append({
+                "arc": arc,
+                "slot": slot,
+                "over": over,
+                "user_flows": users
+            })
+
+    ind.objectives = (total_cost, total_emission, makespan)
+    return capacity_violations, path_tardy
+
+
+# 变长度编码: 初始化 / 交叉 / 变异 / 修复
+
+
+def random_initial_individual(batches: List[Batch],
+                              path_lib: Dict[Tuple[str, str], List[Path]],
+                              max_paths_per_od: int = 4) -> Individual:
+
+    ind = Individual()
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        paths = path_lib.get(od, [])
         if not paths:
-            lines.append("  * 未找到从 O 到 D 的完整路径（可能流量碎片化或不可达）")
+            ind.od_allocations[od] = []
             continue
-        tot = sum(p[2] for p in paths)
-        lines.append(f"  · 路径条数={len(paths)}，总已分配流量≈{tot:.2f} TEU")
-        for idx, (nodes, modes, q) in enumerate(paths, 1):
-            steps = [f"{a} —[{Mode(m).name}]→ {b2}" for a,b2,m in zip(nodes[:-1], nodes[1:], modes)]
-            lines.append(f"    路径 {idx}: " + "  ->  ".join(steps) + f"  | 流量={q:.2f} TEU")
-        splits = [(j, m, n, k, y) for (j, m, n, k), y in aux.y_jmnk.items() if k == b.id and y > 1e-9]
-        if splits:
-            lines.append("  · 拆分/转运节点：")
-            for (j, m, n, _, y) in sorted(splits, key=lambda x: -x[4]):
-                cap = params.CAP_node.get(j, float('inf'))
-                thr = batch_node_in.get((b.id, j), 0.0)
-                lines.append(f"      {j}: {Mode(m).name}→{Mode(n).name}, 量={y:.2f} TEU；容量={cap:.2f} TEU/h，本批次在此={thr:.2f} TEU")
+        L = random.randint(1, min(max_paths_per_od, len(paths)))
+        chosen = random.sample(paths, L)
+        rand_vals = np.random.rand(L)
+        shares = rand_vals / rand_vals.sum()
+        ind.od_allocations[od] = [
+            PathAllocation(p.path_id, float(s))
+            for p, s in zip(chosen, shares)
+        ]
+    return ind
+
+
+def fix_shares_for_all_ods(ind: Individual):
+
+    for od, allocs in list(ind.od_allocations.items()):
+        for a in allocs:
+            if a.share < 0:
+                a.share = 0.0
+        allocs = [a for a in allocs if a.share > 1e-9]
+        if not allocs:
+            ind.od_allocations[od] = []
+            continue
+        ssum = sum(a.share for a in allocs)
+        if ssum <= 0:
+            allocs[0].share = 1.0
+            allocs = [allocs[0]]
         else:
-            lines.append("  · 本批次未发生模式转换")
-    return "\n".join(lines)
-
-def format_batch_times(model: MultimodalOptimizationModel, aux: AuxiliaryVariables) -> str:
-    lines = []
-    lines.append("每个批次的总时间（ET→到达）与迟到")
-    lines.append("-"*80)
-    for b in model.batches:
-        arr = max([t for (j, k), t in aux.a_jk.items() if k == b.id and j == b.DEST_k], default=b.ET_k)
-        total_h = arr - b.ET_k
-        tard = max(0.0, arr - b.LT_k)
-        lines.append(f"Batch {b.id}: {b.O_k} → {b.DEST_k} | total={total_h:.2f}h ({total_h/24:.1f} d) | tardiness={tard:.2f}h")
-    return "\n".join(lines)
+            for a in allocs:
+                a.share = a.share / ssum
+        ind.od_allocations[od] = allocs
 
 
-主程序
+def crossover_paths_for_od(allocs1: List[PathAllocation],
+                           allocs2: List[PathAllocation]) -> Tuple[List[PathAllocation], List[PathAllocation]]:
+
+    if not allocs1 and not allocs2:
+        return [], []
+    if not allocs1:
+        return allocs2.copy(), []
+    if not allocs2:
+        return allocs1.copy(), []
+
+    L1, L2 = len(allocs1), len(allocs2)
+    L = max(L1, L2)
+
+    placeholder = PathAllocation(path_id=-1, share=0.0)
+    a1 = allocs1.copy() + [placeholder] * (L - L1)
+    a2 = allocs2.copy() + [placeholder] * (L - L2)
+
+    cut = random.randint(1, L - 1) if L > 1 else 1
+    c1 = a1[:cut] + a2[cut:]
+    c2 = a2[:cut] + a1[cut:]
+
+    def clean(child: List[PathAllocation]) -> List[PathAllocation]:
+        tmp: Dict[int, float] = {}
+        for a in child:
+            if a.path_id == -1:
+                continue
+            tmp[a.path_id] = tmp.get(a.path_id, 0.0) + a.share
+        return [PathAllocation(pid, sh) for pid, sh in tmp.items() if sh > 1e-9]
+
+    return clean(c1), clean(c2)
 
 
-def main():
-    candidates = ['extended.xlsx','Low Carbon/extended.xlsx','low carbon/extended.xlsx','../extended.xlsx','../Low Carbon/extended.xlsx']
-    xfile = None
-    for p in candidates:
-        if os.path.exists(p): xfile = p; break
-    if not xfile:
-        print("错误：找不到 extended.xlsx")
-        for p in candidates: print("  -", p)
+def crossover(parent1: Individual, parent2: Individual,
+              batches: List[Batch]) -> Tuple[Individual, Individual]:
+
+    child1 = Individual()
+    child2 = Individual()
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        allocs1 = parent1.od_allocations.get(od, [])
+        allocs2 = parent2.od_allocations.get(od, [])
+        c1_allocs, c2_allocs = crossover_paths_for_od(allocs1, allocs2)
+        child1.od_allocations[od] = c1_allocs
+        child2.od_allocations[od] = c2_allocs
+    fix_shares_for_all_ods(child1)
+    fix_shares_for_all_ods(child2)
+    return child1, child2
+
+
+def mutate(ind: Individual, batches: List[Batch],
+           path_lib: Dict[Tuple[str, str], List[Path]],
+           p_add=0.25, p_del=0.25, p_mod=0.25, p_replace=0.25):
+
+    batch = random.choice(batches)
+    od = (batch.origin, batch.destination)
+    allocs = ind.od_allocations.get(od, [])
+    paths = path_lib.get(od, [])
+    if not paths:
+        return
+    if not allocs:
+        p = random.choice(paths)
+        ind.od_allocations[od] = [PathAllocation(p.path_id, 1.0)]
         return
 
-    reader = ExcelDataReader(xfile)
-    params, network = reader.build()
+    op = random.random()
+    cum_add = p_add
+    cum_del = cum_add + p_del
+    cum_mod = cum_del + p_mod
 
-    # 批次
-    batches: List[Batch] = []
-    major_o = ["Xi'an","Chongqing","Zhengzhou","Wuhan"]
-    major_d = ["Berlin","Hamburg","Duisburg","Munich"]
-    bid = 1
-    for o in major_o:
-        for d in major_d:
-            if o in network['nodes'] and d in network['nodes']:
-                batches.append(Batch(id=bid, O_k=o, DEST_k=d,
-                                     Q_k=random.uniform(60,140),
-                                     ET_k=0.0, LT_k=960.0))
-                bid += 1
-    print(f"批次数: {len(batches)}")
+    if op < cum_add:
+        used = {a.path_id for a in allocs}
+        candidates = [p for p in paths if p.path_id not in used]
+        if candidates:
+            new_p = random.choice(candidates)
+            delta = 0.1
+            for a in allocs:
+                a.share *= (1 - delta)
+            allocs.append(PathAllocation(new_p.path_id, delta))
 
-    # 路径库
-    ODs = sorted(set((b.O_k, b.DEST_k) for b in batches))
-    path_library = build_path_library(network, ODs, k=8)
-    print("路径库规模：")
-    for od in ODs:
-        print(f"  {od}: {len(path_library.get(od, []))} 条")
+    elif op < cum_del:
+        if len(allocs) > 1:
+            rm = random.choice(allocs)
+            allocs = [a for a in allocs if a.path_id != rm.path_id]
 
-    # 模型 + 经典 NSGA-II
-    model = MultimodalOptimizationModel(params, network, batches)
-    algo = ClassicNSGA2(model=model, batches=batches, path_library=path_library,
-                        pop_size=40, n_generations=60, crossover_prob=0.9,
-                        mutation_prob=0.3, max_paths_per_od=3)
-    pareto, memory = algo.run()
+    elif op < cum_mod:
+        if len(allocs) >= 2:
+            a1, a2 = random.sample(allocs, 2)
+            max_delta = 0.3 * a1.share
+            if max_delta > 0:
+                delta = random.random() * max_delta
+                a1.share -= delta
+                a2.share += delta
 
-    # ===== 控制台输出 =====
-    print("\n" + "="*80)
-    print("PARETO 最优（最多10个）")
-    print("="*80)
-    if not pareto:
-        print("未得到前沿解，请检查数据/参数。")
-        return
-
-    pareto_sorted = sorted(pareto, key=lambda x: x[1][0])  # 按成本
-    for i,(ch,obj) in enumerate(pareto_sorted[:10],1):
-        c,e,t = obj
-        print(f"\n解 {i}: 成本={c:,.2f} | 排放={e:.2f} | 工期={t:.2f}h ({t/24:.1f}d)")
-
-    # 对成本最优解做“逐批次时间摘要”
-    best_ch, best_obj = pareto_sorted[0]
-    item = memory.get_full(best_ch.to_dict())
-    if item and item.get('dv') is not None and item.get('aux') is not None:
-        dv_best, aux_best = item['dv'], item['aux']
     else:
-        dv_best, aux_best = decode_to_dv_aux(best_ch, model, path_library)
+        used = {a.path_id for a in allocs}
+        if len(used) < len(paths):
+            victim = random.choice(allocs)
+            candidates = [p for p in paths if p.path_id not in used]
+            if candidates:
+                new_p = random.choice(candidates)
+                victim.path_id = new_p.path_id
 
-    print("\n--- 成本最优解：逐批次时间摘要 ---")
-    print(format_batch_times(model, aux_best))
+        if allocs:
+            L = len(allocs)
+            alphas = np.ones(L)
+            new_shares = np.random.dirichlet(alphas)
+            for a, s in zip(allocs, new_shares):
+                a.share = float(s)
 
-    # ===== 文件报告 =====
-    out = 'optimization_results.txt'
-    with open(out, 'w', encoding='utf-8') as f:
-        f.write("多批次多式联运网络优化结果（经典 NSGA-II 上层）\n")
-        f.write("="*80 + "\n\n")
-        f.write(f"数据来源: {xfile}\n")
-        f.write(f"批次数量: {len(batches)}\n")
-        f.write(f"节点数量: {len(network['nodes'])}\n")
-        f.write(f"arc_table 条数: {len(network['arc_table'])}\n\n")
+    ind.od_allocations[od] = allocs
+    fix_shares_for_all_ods(ind)
 
-        f.write("Pareto前沿（前10）\n")
-        for i,(ch,obj) in enumerate(pareto_sorted[:10],1):
-            c,e,t = obj
-            f.write(f"解 {i}: 成本={c:,.2f}, 排放={e:.2f}, 工期={t:.2f}h\n")
 
-        f.write("\n\n【成本最优解的详细分配与路线分解】\n")
-        f.write("-"*80 + "\n\n")
-        f.write(build_allocation_report(model, dv_best))
-        f.write("\n\n")
-        f.write(build_route_report(model, dv_best))
-        f.write("\n\n")
-        f.write(format_batch_times(model, aux_best))
-        f.write("\n")
+def repair(ind: Individual,
+           batches: List[Batch],
+           path_lib: Dict[Tuple[str, str], List[Path]],
+           arcs: List[Arc],
+           timetables: List[TimetableEntry]):
 
-    print(f"\n详细报告已保存：{out}")
+    fix_shares_for_all_ods(ind)
+    capacity_violations, path_tardy = evaluate_individual(ind, batches, path_lib, arcs, timetables)
+
+    for v in capacity_violations:
+        arc = v["arc"]
+        slot = v["slot"]
+        over = v["over"]
+        user_flows = v["user_flows"]
+
+        total_slot_flow = sum(f for (_, _, f) in user_flows)
+        if total_slot_flow <= 0:
+            continue
+
+        target = total_slot_flow - over
+        scale = max(target / total_slot_flow, 0.0)
+
+        for batch_id, path_id, _ in user_flows:
+            batch = next(b for b in batches if b.batch_id == batch_id)
+            od = (batch.origin, batch.destination)
+            allocs = ind.od_allocations.get(od, [])
+            for a in allocs:
+                if a.path_id == path_id:
+                    a.share *= scale
+
+    if path_tardy:
+        for (batch_id, path_id) in list(path_tardy.keys()):
+            batch = next(b for b in batches if b.batch_id == batch_id)
+            od = (batch.origin, batch.destination)
+            allocs = ind.od_allocations.get(od, [])
+            if not allocs:
+                continue
+            late_alloc = None
+            for a in allocs:
+                if a.path_id == path_id:
+                    late_alloc = a
+                    break
+            if late_alloc is None:
+                continue
+
+            paths_for_od = path_lib.get(od, [])
+            path_map = {p.path_id: p for p in paths_for_od}
+            feas = []
+            for a in allocs:
+                if a.path_id == path_id:
+                    continue
+                if (batch_id, a.path_id) in path_tardy:
+                    continue
+                if a.path_id in path_map:
+                    feas.append(a)
+
+            if not feas:
+                continue
+
+            delta = late_alloc.share
+            late_alloc.share = 0.0
+            add = delta / len(feas)
+            for a in feas:
+                a.share += add
+            ind.od_allocations[od] = allocs
+
+    fix_shares_for_all_ods(ind)
+
+
+# NSGA-II 
+
+
+def dominates(a: Individual, b: Individual) -> bool:
+    fa, fb = a.objectives, b.objectives
+    return all(x <= y for x, y in zip(fa, fb)) and any(x < y for x, y in zip(fa, fb))
+
+
+def non_dominated_sort(pop: List[Individual]) -> List[List[Individual]]:
+    S = {}
+    n = {}
+    fronts: List[List[Individual]] = [[]]
+
+    for p in pop:
+        S[p] = []
+        n[p] = 0
+        for q in pop:
+            if p is q:
+                continue
+            if dominates(p, q):
+                S[p].append(q)
+            elif dominates(q, p):
+                n[p] += 1
+        if n[p] == 0:
+            fronts[0].append(p)
+
+    i = 0
+    while fronts[i]:
+        nxt = []
+        for p in fronts[i]:
+            for q in S[p]:
+                n[q] -= 1
+                if n[q] == 0:
+                    nxt.append(q)
+        i += 1
+        fronts.append(nxt)
+
+    if not fronts[-1]:
+        fronts.pop()
+    return fronts
+
+
+def crowding_distance(front: List[Individual]):
+    l = len(front)
+    if l == 0:
+        return {}
+    if l == 1:
+        return {front[0]: float("inf")}
+    distances = {ind: 0.0 for ind in front}
+    m = len(front[0].objectives)
+
+    for k in range(m):
+        front.sort(key=lambda ind: ind.objectives[k])
+        distances[front[0]] = distances[front[-1]] = float("inf")
+        fmin = front[0].objectives[k]
+        fmax = front[-1].objectives[k]
+        if fmax == fmin:
+            continue
+        for i in range(1, l - 1):
+            prev = front[i - 1].objectives[k]
+            nxt = front[i + 1].objectives[k]
+            distances[front[i]] += (nxt - prev) / (fmax - fmin)
+    return distances
+
+
+def tournament_select(pop: List[Individual],
+                      distances: Dict[Individual, float],
+                      ranks: Dict[Individual, int]) -> Individual:
+    a, b = random.sample(pop, 2)
+    if ranks[a] < ranks[b]:
+        return a
+    if ranks[b] < ranks[a]:
+        return b
+    if distances[a] > distances[b]:
+        return a
+    return b
+
+
+# 初始种群
+
+
+def build_initial_population(batches, path_lib, arcs, timetables,
+                             big_pool_size=400,
+                             top_k_cost=80,
+                             final_pop_size=30) -> List[Individual]:
+
+    big_pool: List[Individual] = []
+    for _ in range(big_pool_size):
+        ind = random_initial_individual(batches, path_lib)
+        evaluate_individual(ind, batches, path_lib, arcs, timetables)
+        big_pool.append(ind)
+
+    big_pool.sort(key=lambda ind: ind.objectives[0])
+    cost_filtered = big_pool[:top_k_cost]
+
+    def dominates_2D(a: Individual, b: Individual) -> bool:
+        f2a, f3a = a.objectives[1], a.objectives[2]
+        f2b, f3b = b.objectives[1], b.objectives[2]
+        return (f2a <= f2b and f3a <= f3b) and (f2a < f2b or f3a < f3b)
+
+    good: List[Individual] = []
+    for i, s in enumerate(cost_filtered):
+        dom_by_others = False
+        for j, t in enumerate(cost_filtered):
+            if i == j:
+                continue
+            if dominates_2D(t, s):
+                dom_by_others = True
+                break
+        if not dom_by_others:
+            good.append(s)
+
+    pop: List[Individual] = good.copy()
+    while len(pop) < final_pop_size and good:
+        base = random.choice(good)
+        new_ind = Individual(
+            od_allocations={od: [PathAllocation(a.path_id, a.share)
+                                 for a in allocs]
+                            for od, allocs in base.od_allocations.items()}
+        )
+        mutate(new_ind, batches, path_lib)
+        repair(new_ind, batches, path_lib, arcs, timetables)
+        pop.append(new_ind)
+
+    if len(pop) > final_pop_size:
+        pop = random.sample(pop, final_pop_size)
+
+    return pop
+
+
+# 输出解的路径拆分
+
+
+def print_solution_detail(ind: Individual,
+                          batches: List[Batch],
+                          path_lib: Dict[Tuple[str, str], List[Path]],
+                          sol_name: str = "Solution",
+                          file=None):
+    """
+    输出个体在各 OD 上的路径拆分结构。
+    """
+
+    def out(line: str = ""):
+        # 如果提供 file，只写文件；否则只打印
+        if file is not None:
+            file.write(line + "\n")
+        else:
+            print(line)
+
+    out(f"\n===== {sol_name} 详细路径拆分 =====")
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        allocs = ind.od_allocations.get(od, [])
+        allocs = [a for a in allocs if a.share > 1e-6]
+        if not allocs:
+            continue
+
+        paths_for_od = path_lib.get(od, [])
+        path_map = {p.path_id: p for p in paths_for_od}
+
+        out(f"\nOD: {batch.origin} -> {batch.destination}, "
+            f"Quantity={batch.quantity}, 路径条数={len(allocs)}")
+        if len(allocs) == 1:
+            out("  是否发生拆分: 否")
+        else:
+            out("  是否发生拆分: 是")
+
+        for a in allocs:
+            p = path_map.get(a.path_id)
+            if p is None:
+                continue
+            node_str = " -> ".join(p.nodes)
+            out(f"  share = {a.share:.3f}, path_id = {p.path_id}")
+            out(f"    节点序列: {node_str}")
+            out(f"    模式序列: {p.modes}")
+
+
+# 主函数: NSGA-II
+
+
+def run_nsga2(filename="extended.xlsx",
+              pop_size=30,
+              generations=10,
+              pc=0.9,
+              pm=0.3):
+    node_names, arcs, timetables, batches = load_network_from_extended(filename)
+    path_lib = build_path_library(node_names, arcs, batches, timetables)
+
+    population = build_initial_population(
+        batches, path_lib, arcs, timetables,
+        big_pool_size=400,
+        top_k_cost=80,
+        final_pop_size=pop_size
+    )
+
+    for ind in population:
+        repair(ind, batches, path_lib, arcs, timetables)
+
+    for gen in range(generations):
+        for ind in population:
+            evaluate_individual(ind, batches, path_lib, arcs, timetables)
+
+        fronts = non_dominated_sort(population)
+        ranks = {}
+        for i, front in enumerate(fronts):
+            for ind in front:
+                ranks[ind] = i
+
+        all_distances = {}
+        for front in fronts:
+            d = crowding_distance(front)
+            all_distances.update(d)
+
+        mating_pool: List[Individual] = []
+        while len(mating_pool) < pop_size:
+            mating_pool.append(tournament_select(population, all_distances, ranks))
+
+        offspring: List[Individual] = []
+        while len(offspring) < pop_size:
+            if random.random() < pc:
+                p1, p2 = random.sample(mating_pool, 2)
+                c1, c2 = crossover(p1, p2, batches)
+            else:
+                p = random.choice(mating_pool)
+                c1 = Individual(
+                    od_allocations={od: [PathAllocation(a.path_id, a.share)
+                                         for a in allocs]
+                                    for od, allocs in p.od_allocations.items()}
+                )
+                c2 = Individual(
+                    od_allocations={od: [PathAllocation(a.path_id, a.share)
+                                         for a in allocs]
+                                    for od, allocs in p.od_allocations.items()}
+                )
+
+            if random.random() < pm:
+                mutate(c1, batches, path_lib)
+            if random.random() < pm:
+                mutate(c2, batches, path_lib)
+
+            repair(c1, batches, path_lib, arcs, timetables)
+            repair(c2, batches, path_lib, arcs, timetables)
+
+            offspring.append(c1)
+            if len(offspring) < pop_size:
+                offspring.append(c2)
+
+        union = population + offspring
+        for ind in union:
+            evaluate_individual(ind, batches, path_lib, arcs, timetables)
+
+        fronts = non_dominated_sort(union)
+        new_pop: List[Individual] = []
+        for front in fronts:
+            if len(new_pop) + len(front) <= pop_size:
+                new_pop.extend(front)
+            else:
+                d = crowding_distance(front)
+                sorted_front = sorted(front, key=lambda x: d[x], reverse=True)
+                new_pop.extend(sorted_front[:pop_size - len(new_pop)])
+                break
+
+        population = new_pop
+
+        f1_vals = [ind.objectives[0] for ind in population]
+        f2_vals = [ind.objectives[1] for ind in population]
+        f3_vals = [ind.objectives[2] for ind in population]
+        print(f"Gen {gen}: f1(min,mean) = {min(f1_vals):.2f}, {np.mean(f1_vals):.2f}; "
+              f"f2(min) = {min(f2_vals):.2f}; f3(min) = {min(f3_vals):.2f}")
+
+    fronts = non_dominated_sort(population)
+    pareto = fronts[0]
+
+    print("\nFinal Pareto front:")
+    for i, ind in enumerate(pareto):
+        f1, f2, f3 = ind.objectives
+        print(f"Sol {i}: cost={f1:.2f}, emission={f2:.2f}, time={f3:.2f}")
+
+    # 屏幕打印前 3 个解的详细路径
+    for i, ind in enumerate(pareto[:3]):
+        print_solution_detail(ind, batches, path_lib, sol_name=f"Pareto 解 {i}")
+
+    # 将结果单独保存到一个 txt 文件中
+    with open("results.txt", "w", encoding="utf-8") as f:
+        f.write("Final Pareto front:\n")
+        for i, ind in enumerate(pareto):
+            f1, f2, f3 = ind.objectives
+            line = f"Sol {i}: cost={f1:.2f}, emission={f2:.2f}, time={f3:.2f}"
+            f.write(line + "\n")
+
+        for i, ind in enumerate(pareto[:3]):
+            print_solution_detail(ind, batches, path_lib,
+                                  sol_name=f"Pareto 解 {i}", file=f)
+
+    return pareto, population, path_lib, batches
+
 
 if __name__ == "__main__":
-    main()
+    pareto, population, path_lib, batches = run_nsga2(
+        filename="extended.xlsx",
+        pop_size=30,
+        generations=10,
+        pc=0.9,
+        pm=0.3,
+    )
