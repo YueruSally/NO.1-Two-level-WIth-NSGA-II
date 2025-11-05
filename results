@@ -1,105 +1,70 @@
-================================================================================
-多式联运网络优化结果报告
-================================================================================
+Final Pareto front:
+Sol 0: cost=1780747.12, emission=178698403.48, time=614.50
+Sol 1: cost=1780740.41, emission=179480924.01, time=614.50
 
-【目标函数值】
-总成本: $7,533,674.23
-总排放: 175588.00 吨CO2
-完工时间(Makespan): 224.40 小时
+===== Pareto 解 0 详细路径拆分 =====
 
-【批次分配结果】
+OD: Xi'an -> Duisburg, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 23
+    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Wuhan -> Lianyungang -> Rotterdam -> Duisburg
+    模式序列: ['rail', 'rail', 'road', 'rail', 'road', 'road', 'water', 'road']
 
-批次 1: Xi'an → Berlin
-  需求: 100.0 TEU
-  已分配: 100.0 TEU
+OD: Chengdu -> Hamburg, Quantity=100.0, 路径条数=2
+  是否发生拆分: 是
+  share = 0.986, path_id = 30
+    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Wuhan -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
+  share = 0.014, path_id = 42
+    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'road', 'road', 'water']
 
-  子批次 1:
-    数量: 100.0 TEU
-    路径: Xi'an → Urumqi → Almaty → Moscow → Warsaw → Berlin
-    模式: 公路, 公路, 铁路, 铁路, 公路
-    发车时间: 24.0 小时
-    到达时间: 220.5 小时
-    成本: $1688565.33
-    排放: 37751.600 吨CO2
+OD: Lianyungang -> Rotterdam, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 63
+    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Moscow -> Rotterdam
+    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
 
-批次 2: Xi'an → Hamburg
-  需求: 80.0 TEU
-  已分配: 80.0 TEU
+OD: Shanghai -> Warsaw, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 91
+    节点序列: Shanghai -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Warsaw
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'rail']
 
-  子批次 1:
-    数量: 80.0 TEU
-    路径: Xi'an → Urumqi → Almaty → Moscow → Warsaw → Hamburg
-    模式: 公路, 公路, 铁路, 铁路, 铁路
-    发车时间: 24.0 小时
-    到达时间: 224.4 小时
-    成本: $1291418.67
-    排放: 28599.200 吨CO2
+===== Pareto 解 1 详细路径拆分 =====
 
-批次 3: Chongqing → Berlin
-  需求: 120.0 TEU
-  已分配: 120.0 TEU
+OD: Xi'an -> Duisburg, Quantity=100.0, 路径条数=2
+  是否发生拆分: 是
+  share = 0.950, path_id = 23
+    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Wuhan -> Lianyungang -> Rotterdam -> Duisburg
+    模式序列: ['rail', 'rail', 'road', 'rail', 'road', 'road', 'water', 'road']
+  share = 0.050, path_id = 7
+    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Khorgos -> Almaty -> Volgograd -> Duisburg
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
 
-  子批次 1:
-    数量: 70.0 TEU
-    路径: Chongqing → Urumqi → Almaty → Moscow → Warsaw → Berlin
-    模式: 公路, 公路, 铁路, 铁路, 公路
-    发车时间: 0.0 小时
-    到达时间: 220.5 小时
-    成本: $2195859.20
-    排放: 49557.600 吨CO2
+OD: Chengdu -> Hamburg, Quantity=100.0, 路径条数=3
+  是否发生拆分: 是
+  share = 0.618, path_id = 30
+    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Wuhan -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
+  share = 0.105, path_id = 42
+    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'road', 'road', 'water']
+  share = 0.277, path_id = 31
+    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
 
-  子批次 2:
-    数量: 50.0 TEU
-    路径: Chongqing → Urumqi → Almaty → Moscow → Warsaw → Berlin
-    模式: 公路, 公路, 公路, 公路, 铁路
-    发车时间: 24.0 小时
-    到达时间: 190.8 小时
-    成本: $2828170.60
-    排放: 68644.800 吨CO2
+OD: Lianyungang -> Rotterdam, Quantity=100.0, 路径条数=2
+  是否发生拆分: 是
+  share = 0.846, path_id = 63
+    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Moscow -> Rotterdam
+    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
+  share = 0.154, path_id = 69
+    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Malaszewicze -> Rotterdam
+    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
 
-批次 4: Chongqing → Hamburg
-  需求: 90.0 TEU
-  已分配: 90.0 TEU
-
-  子批次 1:
-    数量: 90.0 TEU
-    路径: Chongqing → Urumqi → Almaty → Moscow → Warsaw → Hamburg
-    模式: 公路, 公路, 公路, 公路, 铁路
-    发车时间: 0.0 小时
-    到达时间: 167.8 小时
-    成本: $2094367.95
-    排放: 51726.600 吨CO2
-
-================================================================================
-求解过程故事
-================================================================================
-
-批次 1 分配:
-  路径: Xi'an -> Urumqi -> Almaty -> Moscow -> Warsaw -> Berlin
-  模式: 公路, 公路, 铁路, 铁路, 公路
-  分配量: 100.0 TEU
-  剩余需求: 0.0 TEU
-
-批次 2 分配:
-  路径: Xi'an -> Urumqi -> Almaty -> Moscow -> Warsaw -> Hamburg
-  模式: 公路, 公路, 铁路, 铁路, 铁路
-  分配量: 80.0 TEU
-  剩余需求: 0.0 TEU
-
-批次 3 分配:
-  路径: Chongqing -> Urumqi -> Almaty -> Moscow -> Warsaw -> Berlin
-  模式: 公路, 公路, 铁路, 铁路, 公路
-  分配量: 70.0 TEU
-  剩余需求: 50.0 TEU
-
-批次 3 分配:
-  路径: Chongqing -> Urumqi -> Almaty -> Moscow -> Warsaw -> Berlin
-  模式: 公路, 公路, 公路, 公路, 铁路
-  分配量: 50.0 TEU
-  剩余需求: 0.0 TEU
-
-批次 4 分配:
-  路径: Chongqing -> Urumqi -> Almaty -> Moscow -> Warsaw -> Hamburg
-  模式: 公路, 公路, 公路, 公路, 铁路
-  分配量: 90.0 TEU
-  剩余需求: 0.0 TEU
+OD: Shanghai -> Warsaw, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 91
+    节点序列: Shanghai -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Warsaw
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'rail']
