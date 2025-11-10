@@ -1,70 +1,187 @@
 Final Pareto front:
-Sol 0: cost=1780747.12, emission=178698403.48, time=614.50
-Sol 1: cost=1780740.41, emission=179480924.01, time=614.50
+Sol 0: cost=4159578.95, emission=407194219.90, time=632.73
+Sol 1: cost=4142040.53, emission=407496617.40, time=632.73
 
 ===== Pareto 解 0 详细路径拆分 =====
 
-OD: Xi'an -> Duisburg, Quantity=100.0, 路径条数=1
+OD: Xi'an -> Berlin, Quantity=120.0, 路径条数=1
   是否发生拆分: 否
-  share = 1.000, path_id = 23
-    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Wuhan -> Lianyungang -> Rotterdam -> Duisburg
-    模式序列: ['rail', 'rail', 'road', 'rail', 'road', 'road', 'water', 'road']
+  share = 1.000, path_id = 8
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Lodz -> Berlin
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
 
-OD: Chengdu -> Hamburg, Quantity=100.0, 路径条数=2
+OD: Xi'an -> Duisburg, Quantity=110.0, 路径条数=4
   是否发生拆分: 是
-  share = 0.986, path_id = 30
-    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Wuhan -> Lianyungang -> Hamburg
-    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
-  share = 0.014, path_id = 42
-    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
+  share = 0.500, path_id = 38
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Lodz -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.200, path_id = 39
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Warsaw -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.200, path_id = 42
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Rotterdam -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 45
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Bratislava -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+
+OD: Chongqing -> Duisburg, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 88
+    节点序列: Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Lianyungang -> Hamburg -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'water', 'water']
+
+OD: Chongqing -> Hamburg, Quantity=95.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 94
+    节点序列: Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Wuhan -> Suzhou -> Lianyungang -> Hamburg
     模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'road', 'road', 'water']
 
-OD: Lianyungang -> Rotterdam, Quantity=100.0, 路径条数=1
-  是否发生拆分: 否
-  share = 1.000, path_id = 63
-    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Moscow -> Rotterdam
-    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
+OD: Chengdu -> Lodz, Quantity=130.0, 路径条数=2
+  是否发生拆分: 是
+  share = 0.900, path_id = 121
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Lodz
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.100, path_id = 124
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Tashkent -> Lodz
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
 
-OD: Shanghai -> Warsaw, Quantity=100.0, 路径条数=1
+OD: Zhengzhou -> Hamburg, Quantity=115.0, 路径条数=1
   是否发生拆分: 否
-  share = 1.000, path_id = 91
-    节点序列: Shanghai -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Warsaw
-    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'rail']
+  share = 1.000, path_id = 172
+    节点序列: Zhengzhou -> Manzhouli -> Yekaterinburg -> Moscow -> Lodz -> Almaty -> Minsk -> Warsaw -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'rail', 'rail', 'road']
+
+OD: Wuhan -> Warsaw, Quantity=105.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 180
+    节点序列: Wuhan -> Yiwu -> Ningbo -> Hamburg -> Warsaw
+    模式序列: ['rail', 'road', 'water', 'rail']
+
+OD: Yiwu -> Rotterdam, Quantity=90.0, 路径条数=3
+  是否发生拆分: 是
+  share = 0.400, path_id = 210
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Budapest -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.500, path_id = 223
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Duisburg -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'water']
+  share = 0.100, path_id = 220
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Malaszewicze -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+
+OD: Suzhou -> Prague, Quantity=125.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 240
+    节点序列: Suzhou -> Nanjing -> Hefei -> Xiangyang -> Zhengzhou -> Manzhouli -> Yekaterinburg -> Moscow -> Prague
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road']
+
+OD: Hefei -> Budapest, Quantity=140.0, 路径条数=4
+  是否发生拆分: 是
+  share = 0.500, path_id = 271
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.200, path_id = 273
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Bishkek -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 274
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Tashkent -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.200, path_id = 278
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Kazan -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
 
 ===== Pareto 解 1 详细路径拆分 =====
 
-OD: Xi'an -> Duisburg, Quantity=100.0, 路径条数=2
+OD: Xi'an -> Berlin, Quantity=120.0, 路径条数=3
   是否发生拆分: 是
-  share = 0.950, path_id = 23
-    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Wuhan -> Lianyungang -> Rotterdam -> Duisburg
-    模式序列: ['rail', 'rail', 'road', 'rail', 'road', 'road', 'water', 'road']
-  share = 0.050, path_id = 7
-    节点序列: Xi'an -> Urumqi -> Xi'an -> Chongqing -> Chengdu -> Khorgos -> Almaty -> Volgograd -> Duisburg
+  share = 0.400, path_id = 8
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Lodz -> Berlin
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.400, path_id = 26
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Warsaw -> Lodz -> Berlin
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.200, path_id = 9
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Warsaw -> Berlin
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+
+OD: Xi'an -> Duisburg, Quantity=110.0, 路径条数=4
+  是否发生拆分: 是
+  share = 0.600, path_id = 38
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Lodz -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.200, path_id = 39
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Warsaw -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 42
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Rotterdam -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 45
+    节点序列: Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Minsk -> Malaszewicze -> Bratislava -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+
+OD: Chongqing -> Duisburg, Quantity=100.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 88
+    节点序列: Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Lianyungang -> Hamburg -> Duisburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'water', 'water']
+
+OD: Chongqing -> Hamburg, Quantity=95.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 105
+    节点序列: Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Hefei -> Lianyungang -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'road', 'road', 'water']
+
+OD: Chengdu -> Lodz, Quantity=130.0, 路径条数=4
+  是否发生拆分: 是
+  share = 0.700, path_id = 121
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Lodz
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.100, path_id = 124
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Tashkent -> Lodz
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 123
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Bishkek -> Lodz
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
+  share = 0.100, path_id = 122
+    节点序列: Chengdu -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Astana -> Lodz
     模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
 
-OD: Chengdu -> Hamburg, Quantity=100.0, 路径条数=3
-  是否发生拆分: 是
-  share = 0.618, path_id = 30
-    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Wuhan -> Lianyungang -> Hamburg
-    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
-  share = 0.105, path_id = 42
-    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
-    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'road', 'road', 'water']
-  share = 0.277, path_id = 31
-    节点序列: Chengdu -> Chongqing -> Chengdu -> Khorgos -> Urumqi -> Xi'an -> Zhengzhou -> Lianyungang -> Hamburg
-    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'water']
-
-OD: Lianyungang -> Rotterdam, Quantity=100.0, 路径条数=2
-  是否发生拆分: 是
-  share = 0.846, path_id = 63
-    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Moscow -> Rotterdam
-    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
-  share = 0.154, path_id = 69
-    节点序列: Lianyungang -> Hamburg -> Warsaw -> Minsk -> Astana -> Almaty -> Bishkek -> Malaszewicze -> Rotterdam
-    模式序列: ['water', 'rail', 'rail', 'rail', 'rail', 'road', 'road', 'road']
-
-OD: Shanghai -> Warsaw, Quantity=100.0, 路径条数=1
+OD: Zhengzhou -> Hamburg, Quantity=115.0, 路径条数=1
   是否发生拆分: 否
-  share = 1.000, path_id = 91
-    节点序列: Shanghai -> Chongqing -> Guangzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Warsaw
-    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'rail']
+  share = 1.000, path_id = 154
+    节点序列: Zhengzhou -> Manzhouli -> Yekaterinburg -> Moscow -> Lodz -> Almaty -> Astana -> St.Petersburg -> Hamburg
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'road', 'rail', 'road', 'water']
+
+OD: Wuhan -> Warsaw, Quantity=105.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 180
+    节点序列: Wuhan -> Yiwu -> Ningbo -> Hamburg -> Warsaw
+    模式序列: ['rail', 'road', 'water', 'rail']
+
+OD: Yiwu -> Rotterdam, Quantity=90.0, 路径条数=3
+  是否发生拆分: 是
+  share = 0.200, path_id = 210
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Budapest -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.500, path_id = 223
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Duisburg -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'water']
+  share = 0.300, path_id = 220
+    节点序列: Yiwu -> Wuhan -> Erenhot -> Moscow -> Lodz -> Berlin -> Prague -> Malaszewicze -> Rotterdam
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road', 'road']
+
+OD: Suzhou -> Prague, Quantity=125.0, 路径条数=1
+  是否发生拆分: 否
+  share = 1.000, path_id = 240
+    节点序列: Suzhou -> Nanjing -> Hefei -> Xiangyang -> Zhengzhou -> Manzhouli -> Yekaterinburg -> Moscow -> Prague
+    模式序列: ['rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'rail', 'road']
+
+OD: Hefei -> Budapest, Quantity=140.0, 路径条数=2
+  是否发生拆分: 是
+  share = 0.900, path_id = 271
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Minsk -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'rail', 'road']
+  share = 0.100, path_id = 278
+    节点序列: Hefei -> Nanjing -> Suzhou -> Xi'an -> Urumqi -> Khorgos -> Almaty -> Kazan -> Budapest
+    模式序列: ['rail', 'rail', 'road', 'rail', 'rail', 'rail', 'road', 'road']
