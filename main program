@@ -5,13 +5,24 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ========================
+# 全局设置
+# ========================
 
 # 时间分桶大小（小时）
 TIME_BUCKET_H = 1.0
 
+# 区域标签集合（需要与你的 Nodes 表中 Region 列保持一致，可按需要修改）
+CHINA_REGIONS = {"CN", "China"}
+EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
 
+
+# ========================
 # 数据结构定义
-
+# ========================
 
 @dataclass
 class Arc:
@@ -71,18 +82,19 @@ class Individual:
     objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
 
 
+# ========================
 # Excel 数据读取
-
+# ========================
 
 def load_network_from_extended(filename: str):
     """
-    从 extended.xlsx 中读取 Nodes, Arcs_All, Timetable, Batches。
+    从 Excel 文件中读取 Nodes, Arcs_All, Timetable, Batches。
     """
     xls = pd.ExcelFile(filename)
 
     # Nodes
     if "Nodes" not in xls.sheet_names:
-        raise ValueError("extended.xlsx 中必须包含 Nodes 表")
+        raise ValueError(f"{filename} 中必须包含 Nodes 表")
     nodes_df = pd.read_excel(xls, "Nodes")
     for c in ["EnglishName", "Region"]:
         if c not in nodes_df.columns:
@@ -98,7 +110,7 @@ def load_network_from_extended(filename: str):
 
     # Arcs_All
     if "Arcs_All" not in xls.sheet_names:
-        raise ValueError("extended.xlsx 中必须包含 Arcs_All 表")
+        raise ValueError(f"{filename} 中必须包含 Arcs_All 表")
     arcs_df = pd.read_excel(xls, "Arcs_All")
     required_arc_cols = [
         "OriginEN", "DestEN", "Mode",
@@ -153,7 +165,7 @@ def load_network_from_extended(filename: str):
 
     # Timetable
     if "Timetable" not in xls.sheet_names:
-        raise ValueError("extended.xlsx 中必须包含 Timetable 表")
+        raise ValueError(f"{filename} 中必须包含 Timetable 表")
     tdf = pd.read_excel(xls, "Timetable")
     required_tt_cols = [
         "OriginEN", "DestEN", "Mode",
@@ -207,10 +219,10 @@ def load_network_from_extended(filename: str):
             )
         )
 
-    # Batches
+    # Batches：只保留“起点在中国、终点在欧洲”的 OD
     if "Batches" not in xls.sheet_names:
         raise ValueError(
-            "extended.xlsx 中必须包含 Batches 表，并包含列: "
+            f"{filename} 中必须包含 Batches 表，并包含列: "
             "BatchID, OriginEN, DestEN, QuantityTEU, ET, LT"
         )
     bdf = pd.read_excel(xls, "Batches")
@@ -227,6 +239,14 @@ def load_network_from_extended(filename: str):
         qty = float(row["QuantityTEU"])
         et = float(row["ET"])
         lt = float(row["LT"])
+
+        o_reg = node_region.get(origin)
+        d_reg = node_region.get(dest)
+
+        # 核心筛选条件：起点在中国区域，终点在欧洲区域
+        if o_reg not in CHINA_REGIONS or d_reg not in EUROPE_REGIONS:
+            continue
+
         batches.append(
             Batch(
                 batch_id=bid,
@@ -241,8 +261,9 @@ def load_network_from_extended(filename: str):
     return node_names, arcs, timetables, batches
 
 
+# ========================
 # 路径库构建
-
+# ========================
 
 def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
     g: Dict[str, List[Tuple[str, Arc]]] = {}
@@ -253,23 +274,35 @@ def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
 
 def random_dfs_paths(graph, origin, dest,
                      max_len=8, max_paths=30) -> List[List[Arc]]:
-
+    """
+    使用 DFS 随机生成不含环路的简单路径：
+    - 路径中不允许任何节点重复，包括起点
+    """
     paths: List[List[Arc]] = []
 
-    def dfs(node, cur):
-        if len(paths) >= max_paths or len(cur) > max_len:
+    def dfs(node: str,
+            cur_arcs: List[Arc],
+            visited_nodes: set):
+        if len(paths) >= max_paths or len(cur_arcs) > max_len:
             return
-        if node == dest and cur:
-            paths.append(cur.copy())
+
+        if node == dest and cur_arcs:
+            paths.append(cur_arcs.copy())
             return
+
         for nxt, arc in graph.get(node, []):
-            if any(a.to_node == nxt for a in cur):
+            if nxt in visited_nodes:
                 continue
             if random.random() < 0.1:
                 continue
-            dfs(nxt, cur + [arc])
 
-    dfs(origin, [])
+            dfs(
+                nxt,
+                cur_arcs + [arc],
+                visited_nodes | {nxt}
+            )
+
+    dfs(origin, [], {origin})
     return paths
 
 
@@ -311,13 +344,26 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
             )
             next_path_id += 1
 
+        # 剔除“极度绕路”的路径：按成本过滤 + 限制条数
+        if paths_for_od:
+            paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
+            best_cost = paths_for_od[0].base_cost_per_teu
+            cost_factor = 1.3
+            filtered = [
+                p for p in paths_for_od
+                if p.base_cost_per_teu <= cost_factor * best_cost
+            ]
+            max_keep = 10
+            paths_for_od = filtered[:max_keep]
+
         path_lib[od] = paths_for_od
 
     return path_lib
 
 
+# ========================
 # 下层调度：时刻表 + 时间分桶容量统计
-
+# ========================
 
 def get_timetable_entries(timetables: List[TimetableEntry],
                           from_node: str, to_node: str, mode: str) -> List[TimetableEntry]:
@@ -355,8 +401,6 @@ def simulate_path_with_timetable_and_capacity(path: Path,
             else:
                 n = math.ceil((t - fd) / hd)
                 dep = fd + n * hd
-            if dep < t:
-                dep = t
 
         travel = arc.distance / max(arc.speed_kmh, 1.0)
         arr = dep + travel
@@ -376,12 +420,90 @@ def simulate_path_with_timetable_and_capacity(path: Path,
     return t - batch.ET
 
 
+def simulate_path_dry(path: Path,
+                      batch: Batch,
+                      flow_teu: float,
+                      timetables: List[TimetableEntry],
+                      bucket_size: float):
+    """
+    干跑模拟：返回占用的 arc-slot 列表和到达时间，不写入全局。
+    """
+    t = batch.ET
+    touched: List[Tuple[Tuple[str, str, str, int], float]] = []
+
+    for arc in path.arcs:
+        entries = get_timetable_entries(timetables, arc.from_node, arc.to_node, arc.mode)
+
+        if not entries:
+            dep = t
+        else:
+            e = entries[0]
+            fd = e.first_departure_hour
+            hd = e.headway_hours if e.headway_hours > 0 else 24.0
+            if t <= fd:
+                dep = fd
+            else:
+                n = math.ceil((t - fd) / hd)
+                dep = fd + n * hd
+
+        travel = arc.distance / max(arc.speed_kmh, 1.0)
+        arr = dep + travel
+
+        start_slot = int(dep // bucket_size)
+        end_slot = int((arr - 1e-6) // bucket_size)
+        for slot in range(start_slot, end_slot + 1):
+            touched.append(((arc.from_node, arc.to_node, arc.mode, slot), flow_teu))
+
+        t = arr
+
+    arrival_time = t
+    return touched, arrival_time
+
+
 def build_arc_index(arcs: List[Arc]) -> Dict[Tuple[str, str, str], Arc]:
     return {(a.from_node, a.to_node, a.mode): a for a in arcs}
 
 
-# 适应度计算
+def try_commit_flow(path: Path,
+                    batch: Batch,
+                    flow_teu: float,
+                    timetables: List[TimetableEntry],
+                    bucket_size: float,
+                    arc_flow_by_time: Dict[Tuple[str, str, str, int], float],
+                    arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float],
+                    arc_index: Dict[Tuple[str, str, str], Arc]) -> bool:
+    """
+    先干跑拿到占用，再检查容量和 LT，若通过则写入全局结构。
+    """
+    touched, arrival_time = simulate_path_dry(
+        path, batch, flow_teu, timetables, bucket_size
+    )
 
+    if arrival_time > batch.LT:
+        return False
+
+    # 容量检查
+    for (fn, tn, m, slot), add in touched:
+        arc = arc_index.get((fn, tn, m))
+        if arc is None:
+            return False
+        cur = arc_flow_by_time.get((fn, tn, m, slot), 0.0)
+        if cur + add > arc.capacity + 1e-9:
+            return False
+
+    # 真正写入
+    for (fn, tn, m, slot), add in touched:
+        key = (fn, tn, m, slot)
+        arc_flow_by_time[key] = arc_flow_by_time.get(key, 0.0) + add
+        user_key = (fn, tn, m, slot, batch.batch_id, path.path_id)
+        arc_slot_user_flow[user_key] = arc_slot_user_flow.get(user_key, 0.0) + add
+
+    return True
+
+
+# ========================
+# 适应度计算
+# ========================
 
 def evaluate_individual(ind: Individual,
                         batches: List[Batch],
@@ -451,10 +573,9 @@ def evaluate_individual(ind: Individual,
         arc_slot_to_users.setdefault(key, []).append((bid, pid, flow))
 
     for (fn, tn, m, slot), load in arc_flow_by_time.items():
-        arc_key = (fn, tn, m)
-        if arc_key not in arc_index:
+        arc = arc_index.get((fn, tn, m))
+        if arc is None:
             continue
-        arc = arc_index[arc_key]
         cap = arc.capacity
         if load > cap:
             over = load - cap
@@ -470,8 +591,48 @@ def evaluate_individual(ind: Individual,
     return capacity_violations, path_tardy
 
 
-# 变长度编码: 初始化 / 交叉 / 变异 / 修复
+# ========================
+# 工具：share 离散化
+# ========================
 
+def discretize_shares_for_all_ods(ind: Individual, step: float = 0.1):
+    """
+    将每个 OD 上的路径 share 离散化到 {0, step, 2*step, ..., 1}，且和为 1。
+    默认 step=0.1。
+    """
+    if step <= 0 or step > 1:
+        return
+    M = int(round(1.0 / step))
+
+    for od, allocs in ind.od_allocations.items():
+        if not allocs:
+            continue
+
+        raw = [max(a.share, 0.0) for a in allocs]
+        total = sum(raw)
+        if total <= 0:
+            raw = [1.0] * len(allocs)
+            total = float(len(allocs))
+        norm = [r / total for r in raw]
+
+        base_counts = [int(math.floor(s * M)) for s in norm]
+        sum_base = sum(base_counts)
+        remainder = M - sum_base
+
+        fracs = [(norm[i] * M - base_counts[i], i) for i in range(len(allocs))]
+        fracs.sort(reverse=True)
+        for k in range(remainder):
+            idx = fracs[k % len(allocs)][1]
+            base_counts[idx] += 1
+
+        shares = [c / M for c in base_counts]
+        for a, sh in zip(allocs, shares):
+            a.share = sh
+
+
+# ========================
+# 变长度编码: 初始化 / 交叉 / 变异 / 修复
+# ========================
 
 def random_initial_individual(batches: List[Batch],
                               path_lib: Dict[Tuple[str, str], List[Path]],
@@ -492,6 +653,8 @@ def random_initial_individual(batches: List[Batch],
             PathAllocation(p.path_id, float(s))
             for p, s in zip(chosen, shares)
         ]
+
+    discretize_shares_for_all_ods(ind, step=0.1)
     return ind
 
 
@@ -561,6 +724,8 @@ def crossover(parent1: Individual, parent2: Individual,
         child2.od_allocations[od] = c2_allocs
     fix_shares_for_all_ods(child1)
     fix_shares_for_all_ods(child2)
+    discretize_shares_for_all_ods(child1, step=0.1)
+    discretize_shares_for_all_ods(child2, step=0.1)
     return child1, child2
 
 
@@ -577,6 +742,7 @@ def mutate(ind: Individual, batches: List[Batch],
     if not allocs:
         p = random.choice(paths)
         ind.od_allocations[od] = [PathAllocation(p.path_id, 1.0)]
+        discretize_shares_for_all_ods(ind, step=0.1)
         return
 
     op = random.random()
@@ -626,6 +792,7 @@ def mutate(ind: Individual, batches: List[Batch],
 
     ind.od_allocations[od] = allocs
     fix_shares_for_all_ods(ind)
+    discretize_shares_for_all_ods(ind, step=0.1)
 
 
 def repair(ind: Individual,
@@ -695,10 +862,12 @@ def repair(ind: Individual,
             ind.od_allocations[od] = allocs
 
     fix_shares_for_all_ods(ind)
+    discretize_shares_for_all_ods(ind, step=0.1)
 
 
-# NSGA-II 
-
+# ========================
+# NSGA-II 基本算子
+# ========================
 
 def dominates(a: Individual, b: Individual) -> bool:
     fa, fb = a.objectives, b.objectives
@@ -775,60 +944,133 @@ def tournament_select(pop: List[Individual],
     return b
 
 
-# 初始种群
+# ========================
+# 构造式“可行”个体 + 初始种群
+# ========================
+
+def constructive_feasible_individual(batches: List[Batch],
+                                     path_lib: Dict[Tuple[str, str], List[Path]],
+                                     arcs: List[Arc],
+                                     timetables: List[TimetableEntry],
+                                     share_step: float = 0.1,
+                                     topK_paths: int = 8,
+                                     cost_slack: float = 0.2) -> Individual:
+    """
+    构造一个“尽量可行”的个体：
+    - 每个 OD 的批次按 share_step 拆成 M 份（M=1/share_step）；
+    - 每份优先放到成本较低且可行的路径上（允许 best*(1+cost_slack) 以内随机选择）；
+    - 提交前用 try_commit_flow 做容量+LT 检查。
+    """
+    ind = Individual()
+    arc_index = build_arc_index(arcs)
+    arc_flow_by_time: Dict[Tuple[str, str, str, int], float] = {}
+    arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float] = {}
+
+    if share_step <= 0 or share_step > 1:
+        share_step = 0.1
+    M = int(round(1.0 / share_step))
+
+    for batch in batches:
+        od = (batch.origin, batch.destination)
+        paths = path_lib.get(od, [])
+        if not paths:
+            ind.od_allocations[od] = []
+            continue
+
+        # 候选路径：按成本排序，取前 topK，再允许 best*(1+cost_slack) 范围
+        paths_sorted = sorted(paths, key=lambda p: p.base_cost_per_teu)
+        best_cost = paths_sorted[0].base_cost_per_teu
+        cand = [p for p in paths_sorted[:topK_paths]
+                if p.base_cost_per_teu <= best_cost * (1.0 + cost_slack)]
+        if not cand:
+            cand = paths_sorted[:min(topK_paths, len(paths_sorted))]
+
+        share_map: Dict[int, float] = {}
+        unit_teu = share_step * batch.quantity
+
+        for _ in range(M):
+            random.shuffle(cand)
+            placed = False
+            for path in cand:
+                if try_commit_flow(path, batch, unit_teu, timetables, TIME_BUCKET_H,
+                                   arc_flow_by_time, arc_slot_user_flow, arc_index):
+                    share_map[path.path_id] = share_map.get(path.path_id, 0.0) + share_step
+                    placed = True
+                    break
+            if not placed:
+                # 这份放不进去就丢弃（对应这部分量不可行）
+                pass
+
+        total_share = sum(share_map.values())
+        if total_share > 0:
+            norm = {pid: sh / total_share for pid, sh in share_map.items()}
+            ind.od_allocations[od] = [PathAllocation(pid, sh) for pid, sh in norm.items()]
+        else:
+            ind.od_allocations[od] = []
+
+    # 再做一遍离散化让 shares 精确落在网格上
+    discretize_shares_for_all_ods(ind, step=share_step)
+    return ind
 
 
 def build_initial_population(batches, path_lib, arcs, timetables,
                              big_pool_size=400,
-                             top_k_cost=80,
+                             top_k_cost=80,      # 保留接口，不再使用
                              final_pop_size=30) -> List[Individual]:
 
+    # 1) 先用“可行构造”生成大池子
     big_pool: List[Individual] = []
     for _ in range(big_pool_size):
-        ind = random_initial_individual(batches, path_lib)
+        ind = constructive_feasible_individual(
+            batches, path_lib, arcs, timetables,
+            share_step=0.1, topK_paths=8, cost_slack=0.2
+        )
         evaluate_individual(ind, batches, path_lib, arcs, timetables)
         big_pool.append(ind)
 
-    big_pool.sort(key=lambda ind: ind.objectives[0])
-    cost_filtered = big_pool[:top_k_cost]
+    # 2) f1/f2/f3 各取前 10
+    K = 10
+    best_f1 = sorted(big_pool, key=lambda x: x.objectives[0])[:K]
+    best_f2 = sorted(big_pool, key=lambda x: x.objectives[1])[:K]
+    best_f3 = sorted(big_pool, key=lambda x: x.objectives[2])[:K]
 
-    def dominates_2D(a: Individual, b: Individual) -> bool:
-        f2a, f3a = a.objectives[1], a.objectives[2]
-        f2b, f3b = b.objectives[1], b.objectives[2]
-        return (f2a <= f2b and f3a <= f3b) and (f2a < f2b or f3a < f3b)
+    pop: List[Individual] = []
+    for lst in (best_f1, best_f2, best_f3):
+        for ind in lst:
+            if ind not in pop:
+                pop.append(ind)
 
-    good: List[Individual] = []
-    for i, s in enumerate(cost_filtered):
-        dom_by_others = False
-        for j, t in enumerate(cost_filtered):
-            if i == j:
-                continue
-            if dominates_2D(t, s):
-                dom_by_others = True
-                break
-        if not dom_by_others:
-            good.append(s)
-
-    pop: List[Individual] = good.copy()
-    while len(pop) < final_pop_size and good:
-        base = random.choice(good)
-        new_ind = Individual(
+    # 3) 数量不足，用 big_pool 克隆补齐（不在这里 mutate/repair）
+    while len(pop) < final_pop_size:
+        src = random.choice(big_pool)
+        clone = Individual(
             od_allocations={od: [PathAllocation(a.path_id, a.share)
                                  for a in allocs]
-                            for od, allocs in base.od_allocations.items()}
+                            for od, allocs in src.od_allocations.items()},
+            objectives=src.objectives
         )
-        mutate(new_ind, batches, path_lib)
-        repair(new_ind, batches, path_lib, arcs, timetables)
-        pop.append(new_ind)
+        pop.append(clone)
 
+    # 4) 若数量超过，用非支配排序+拥挤度裁剪
     if len(pop) > final_pop_size:
-        pop = random.sample(pop, final_pop_size)
+        fronts = non_dominated_sort(pop)
+        new_pop: List[Individual] = []
+        for front in fronts:
+            if len(new_pop) + len(front) <= final_pop_size:
+                new_pop.extend(front)
+            else:
+                d = crowding_distance(front)
+                sorted_front = sorted(front, key=lambda x: d[x], reverse=True)
+                new_pop.extend(sorted_front[:final_pop_size - len(new_pop)])
+                break
+        pop = new_pop
 
     return pop
 
 
+# ========================
 # 输出解的路径拆分
-
+# ========================
 
 def print_solution_detail(ind: Individual,
                           batches: List[Batch],
@@ -840,7 +1082,6 @@ def print_solution_detail(ind: Individual,
     """
 
     def out(line: str = ""):
-        # 如果提供 file，只写文件；否则只打印
         if file is not None:
             file.write(line + "\n")
         else:
@@ -874,10 +1115,11 @@ def print_solution_detail(ind: Individual,
             out(f"    模式序列: {p.modes}")
 
 
+# ========================
 # 主函数: NSGA-II
+# ========================
 
-
-def run_nsga2(filename="extended.xlsx",
+def run_nsga2(filename="data.xlsx",
               pop_size=30,
               generations=10,
               pc=0.9,
@@ -892,8 +1134,12 @@ def run_nsga2(filename="extended.xlsx",
         final_pop_size=pop_size
     )
 
-    for ind in population:
-        repair(ind, batches, path_lib, arcs, timetables)
+    history_f1_min = []
+    history_f1_mean = []
+    history_f2_min = []
+    history_f3_min = []
+
+    # 不再在这里 repair 初始种群，只在进化过程中处理
 
     for gen in range(generations):
         for ind in population:
@@ -964,8 +1210,49 @@ def run_nsga2(filename="extended.xlsx",
         f1_vals = [ind.objectives[0] for ind in population]
         f2_vals = [ind.objectives[1] for ind in population]
         f3_vals = [ind.objectives[2] for ind in population]
-        print(f"Gen {gen}: f1(min,mean) = {min(f1_vals):.2f}, {np.mean(f1_vals):.2f}; "
-              f"f2(min) = {min(f2_vals):.2f}; f3(min) = {min(f3_vals):.2f}")
+
+        f1_min = min(f1_vals)
+        f1_mean = float(np.mean(f1_vals))
+        f2_min = min(f2_vals)
+        f3_min = min(f3_vals)
+
+        history_f1_min.append(f1_min)
+        history_f1_mean.append(f1_mean)
+        history_f2_min.append(f2_min)
+        history_f3_min.append(f3_min)
+
+        print(f"Gen {gen}: f1(min,mean) = {f1_min:.2f}, {f1_mean:.2f}; "
+              f"f2(min) = {f2_min:.2f}; f3(min) = {f3_min:.2f}")
+
+    generations_axis = list(range(generations))
+
+    plt.figure()
+    plt.plot(generations_axis, history_f1_min, label="f1 min (成本)")
+    plt.plot(generations_axis, history_f1_mean, label="f1 mean (成本平均)")
+    plt.xlabel("Generation")
+    plt.ylabel("Cost")
+    plt.title("成本随代数变化")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("evolution_f1.png")
+
+    plt.figure()
+    plt.plot(generations_axis, history_f2_min, label="f2 min (排放)")
+    plt.xlabel("Generation")
+    plt.ylabel("Emission")
+    plt.title("排放随代数变化")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("evolution_f2.png")
+
+    plt.figure()
+    plt.plot(generations_axis, history_f3_min, label="f3 min (时间)")
+    plt.xlabel("Generation")
+    plt.ylabel("Time (h)")
+    plt.title("完工时间随代数变化")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("evolution_f3.png")
 
     fronts = non_dominated_sort(population)
     pareto = fronts[0]
@@ -975,11 +1262,9 @@ def run_nsga2(filename="extended.xlsx",
         f1, f2, f3 = ind.objectives
         print(f"Sol {i}: cost={f1:.2f}, emission={f2:.2f}, time={f3:.2f}")
 
-    # 屏幕打印前 3 个解的详细路径
     for i, ind in enumerate(pareto[:3]):
         print_solution_detail(ind, batches, path_lib, sol_name=f"Pareto 解 {i}")
 
-    # 将结果单独保存到一个 txt 文件中
     with open("results.txt", "w", encoding="utf-8") as f:
         f.write("Final Pareto front:\n")
         for i, ind in enumerate(pareto):
@@ -996,7 +1281,7 @@ def run_nsga2(filename="extended.xlsx",
 
 if __name__ == "__main__":
     pareto, population, path_lib, batches = run_nsga2(
-        filename="extended.xlsx",
+        filename="data.xlsx",  # 你的真实数据文件名
         pop_size=30,
         generations=10,
         pc=0.9,
