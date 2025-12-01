@@ -12,10 +12,8 @@ import matplotlib.pyplot as plt
 # 全局设置
 # ========================
 
-# 时间分桶大小（小时）
 TIME_BUCKET_H = 1.0
 
-# 区域标签集合（需要与你的 Nodes 表中 Region 列保持一致，可按需要修改）
 CHINA_REGIONS = {"CN", "China"}
 EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
 
@@ -30,7 +28,7 @@ class Arc:
     to_node: str
     mode: str
     distance: float
-    capacity: float              # 每个时间段容量（TEU）
+    capacity: float
     cost_per_teu_km: float
     emission_per_teu_km: float
     speed_kmh: float
@@ -77,9 +75,8 @@ class PathAllocation:
 
 @dataclass(eq=False)
 class Individual:
-    # 变长度编码：每个 OD 对应一个可变长度路径集合
     # key: (origin, dest)
-    # value: List[PathAllocation(path_id, share)]，其中各 share 之和为 1
+    # value: List[PathAllocation(path_id, share)]，各 share 之和为 1
     od_allocations: Dict[Tuple[str, str], List[PathAllocation]] = field(default_factory=dict)
     objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
 
@@ -89,9 +86,6 @@ class Individual:
 # ========================
 
 def load_network_from_extended(filename: str):
-    """
-    从 Excel 文件中读取 Nodes, Arcs_All, Timetable, Batches。
-    """
     xls = pd.ExcelFile(filename)
 
     # Nodes
@@ -221,7 +215,7 @@ def load_network_from_extended(filename: str):
             )
         )
 
-    # Batches：只保留“起点在中国、终点在欧洲”的 OD
+    # Batches（仅保留“起点中国、终点欧洲”）
     if "Batches" not in xls.sheet_names:
         raise ValueError(
             f"{filename} 中必须包含 Batches 表，并包含列: "
@@ -245,7 +239,6 @@ def load_network_from_extended(filename: str):
         o_reg = node_region.get(origin)
         d_reg = node_region.get(dest)
 
-        # 核心筛选条件：起点在中国区域，终点在欧洲区域
         if o_reg not in CHINA_REGIONS or d_reg not in EUROPE_REGIONS:
             continue
 
@@ -276,9 +269,6 @@ def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
 
 def random_dfs_paths(graph, origin, dest,
                      max_len=8, max_paths=30) -> List[List[Arc]]:
-    """
-    使用 DFS 随机生成不含环路的简单路径。
-    """
     paths: List[List[Arc]] = []
 
     def dfs(node: str,
@@ -345,7 +335,6 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
             )
             next_path_id += 1
 
-        # 剔除“极度绕路”的路径：按成本过滤 + 限制条数
         if paths_for_od:
             paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
             best_cost = paths_for_od[0].base_cost_per_teu
@@ -363,7 +352,7 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
 
 
 # ========================
-# 下层调度：时刻表 + 时间分桶容量统计
+# 时刻表仿真 + 容量统计
 # ========================
 
 def get_timetable_entries(timetables: List[TimetableEntry],
@@ -381,9 +370,6 @@ def simulate_path_with_timetable_and_capacity(path: Path,
                                               bucket_size: float,
                                               arc_flow_by_time: Dict[Tuple[str, str, str, int], float],
                                               arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float]) -> float:
-    """
-    路径时间仿真，并在时间分桶上累积流量。
-    """
     t = batch.ET
 
     for arc in path.arcs:
@@ -426,9 +412,6 @@ def simulate_path_dry(path: Path,
                       flow_teu: float,
                       timetables: List[TimetableEntry],
                       bucket_size: float):
-    """
-    干跑模拟：返回占用的 arc-slot 列表和到达时间，不写入全局。
-    """
     t = batch.ET
     touched: List[Tuple[Tuple[str, str, str, int], float]] = []
 
@@ -473,9 +456,6 @@ def try_commit_flow(path: Path,
                     arc_flow_by_time: Dict[Tuple[str, str, str, int], float],
                     arc_slot_user_flow: Dict[Tuple[str, str, str, int, int, int], float],
                     arc_index: Dict[Tuple[str, str, str], Arc]) -> bool:
-    """
-    先干跑拿到占用，再检查容量和 LT，若通过则写入全局结构。
-    """
     touched, arrival_time = simulate_path_dry(
         path, batch, flow_teu, timetables, bucket_size
     )
@@ -483,7 +463,6 @@ def try_commit_flow(path: Path,
     if arrival_time > batch.LT:
         return False
 
-    # 容量检查
     for (fn, tn, m, slot), add in touched:
         arc = arc_index.get((fn, tn, m))
         if arc is None:
@@ -492,7 +471,6 @@ def try_commit_flow(path: Path,
         if cur + add > arc.capacity + 1e-9:
             return False
 
-    # 真正写入
     for (fn, tn, m, slot), add in touched:
         key = (fn, tn, m, slot)
         arc_flow_by_time[key] = arc_flow_by_time.get(key, 0.0) + add
@@ -593,13 +571,10 @@ def evaluate_individual(ind: Individual,
 
 
 # ========================
-# 工具：share 离散化
+# share 处理
 # ========================
 
 def discretize_shares_for_all_ods(ind: Individual, step: float = 0.1):
-    """
-    将每个 OD 上的路径 share 离散化到 {0, step, 2*step, ..., 1}，且和为 1。
-    """
     if step <= 0 or step > 1:
         return
     M = int(round(1.0 / step))
@@ -630,8 +605,27 @@ def discretize_shares_for_all_ods(ind: Individual, step: float = 0.1):
             a.share = sh
 
 
+def fix_shares_for_all_ods(ind: Individual):
+    for od, allocs in list(ind.od_allocations.items()):
+        for a in allocs:
+            if a.share < 0:
+                a.share = 0.0
+        allocs = [a for a in allocs if a.share > 1e-9]
+        if not allocs:
+            ind.od_allocations[od] = []
+            continue
+        ssum = sum(a.share for a in allocs)
+        if ssum <= 0:
+            allocs[0].share = 1.0
+            allocs = [allocs[0]]
+        else:
+            for a in allocs:
+                a.share = a.share / ssum
+        ind.od_allocations[od] = allocs
+
+
 # ========================
-# 变长度编码: 初始化 / 交叉 / 变异 / 修复
+# 交叉 / 变异 / 修复
 # ========================
 
 def random_initial_individual(batches: List[Batch],
@@ -658,45 +652,10 @@ def random_initial_individual(batches: List[Batch],
     return ind
 
 
-def fix_shares_for_all_ods(ind: Individual):
-
-    for od, allocs in list(ind.od_allocations.items()):
-        for a in allocs:
-            if a.share < 0:
-                a.share = 0.0
-        allocs = [a for a in allocs if a.share > 1e-9]
-        if not allocs:
-            ind.od_allocations[od] = []
-            continue
-        ssum = sum(a.share for a in allocs)
-        if ssum <= 0:
-            allocs[0].share = 1.0
-            allocs = [allocs[0]]
-        else:
-            for a in allocs:
-                a.share = a.share / ssum
-        ind.od_allocations[od] = allocs
-
-
-# ==== 新的交叉（不补位） ====
-
-def crossover_paths_for_od_simple(
-    allocs1: List[PathAllocation],
-    allocs2: List[PathAllocation],
-    p_inherit_parent1: float = 0.5,
-) -> Tuple[List[PathAllocation], List[PathAllocation]]:
-    """
-    针对单个 OD 的交叉（不补位版本）。
-
-    思路：
-    - 把每个父代在该 OD 上看成 path_id -> share 的概率分布；
-    - 取 path_id 的并集；
-    - 每个 path_id 上，child1 从父1或父2继承 share，child2 反向继承；
-    - 最后对每个孩子做一次归一化，小 share 的路径自动被过滤。
-    """
+def crossover_paths_for_od(allocs1: List[PathAllocation],
+                           allocs2: List[PathAllocation]) -> Tuple[List[PathAllocation], List[PathAllocation]]:
     if not allocs1 and not allocs2:
         return [], []
-
     if not allocs1:
         return [PathAllocation(a.path_id, a.share) for a in allocs2], []
     if not allocs2:
@@ -712,38 +671,26 @@ def crossover_paths_for_od_simple(
 
     all_pids = set(d1.keys()) | set(d2.keys())
 
-    c1_dict: Dict[int, float] = {}
-    c2_dict: Dict[int, float] = {}
+    child1_dict: Dict[int, float] = {}
+    child2_dict: Dict[int, float] = {}
 
     for pid in all_pids:
         s1 = d1.get(pid, 0.0)
         s2 = d2.get(pid, 0.0)
+        if s1 <= 0 and s2 <= 0:
+            continue
 
-        if random.random() < p_inherit_parent1:
-            c1 = s1
-        else:
-            c1 = s2
-
-        if random.random() < p_inherit_parent1:
-            c2 = s2
-        else:
-            c2 = s1
+        alpha = random.random()
+        c1 = alpha * s1 + (1.0 - alpha) * s2
+        c2 = (1.0 - alpha) * s1 + alpha * s2
 
         if c1 > 1e-9:
-            c1_dict[pid] = c1
+            child1_dict[pid] = c1
         if c2 > 1e-9:
-            c2_dict[pid] = c2
+            child2_dict[pid] = c2
 
-    def dict_to_allocs(d: Dict[int, float]) -> List[PathAllocation]:
-        if not d:
-            return []
-        total = sum(d.values())
-        if total <= 0:
-            return []
-        return [PathAllocation(pid, val / total) for pid, val in d.items() if val > 1e-9]
-
-    child1_allocs = dict_to_allocs(c1_dict)
-    child2_allocs = dict_to_allocs(c2_dict)
+    child1_allocs = [PathAllocation(pid, sh) for pid, sh in child1_dict.items()]
+    child2_allocs = [PathAllocation(pid, sh) for pid, sh in child2_dict.items()]
 
     if not child1_allocs:
         child1_allocs = [PathAllocation(a.path_id, a.share) for a in allocs1]
@@ -755,19 +702,16 @@ def crossover_paths_for_od_simple(
 
 def crossover(parent1: Individual, parent2: Individual,
               batches: List[Batch]) -> Tuple[Individual, Individual]:
-    """
-    染色体交叉：在 path-share 空间上，对每个 OD 独立进行组合。
-    """
+
     child1 = Individual()
     child2 = Individual()
     for batch in batches:
         od = (batch.origin, batch.destination)
         allocs1 = parent1.od_allocations.get(od, [])
         allocs2 = parent2.od_allocations.get(od, [])
-        c1_allocs, c2_allocs = crossover_paths_for_od_simple(allocs1, allocs2)
+        c1_allocs, c2_allocs = crossover_paths_for_od(allocs1, allocs2)
         child1.od_allocations[od] = c1_allocs
         child2.od_allocations[od] = c2_allocs
-
     fix_shares_for_all_ods(child1)
     fix_shares_for_all_ods(child2)
     discretize_shares_for_all_ods(child1, step=0.1)
@@ -775,21 +719,9 @@ def crossover(parent1: Individual, parent2: Individual,
     return child1, child2
 
 
-# ==== 新的变异（不补位） ====
-
 def mutate(ind: Individual, batches: List[Batch],
            path_lib: Dict[Tuple[str, str], List[Path]],
-           p_local=0.5, p_add=0.25, p_del=0.25):
-    """
-    变异算子（在 path-share 空间）：
-    - 随机选一个 OD；
-    - 三类操作：
-        1) 局部扰动：在两条路径之间转移少量 share；
-        2) 引入新路径：从未使用的路径中选一条，加一点 share；
-        3) 删除弱路径：删除 share 最小的一条。
-    """
-    if not batches:
-        return
+           p_add=0.25, p_del=0.25, p_mod=0.25, p_replace=0.25):
 
     batch = random.choice(batches)
     od = (batch.origin, batch.destination)
@@ -797,8 +729,6 @@ def mutate(ind: Individual, batches: List[Batch],
     paths = path_lib.get(od, [])
     if not paths:
         return
-
-    # 如果这个 OD 当前没有任何路径，随机给一条
     if not allocs:
         p = random.choice(paths)
         ind.od_allocations[od] = [PathAllocation(p.path_id, 1.0)]
@@ -806,18 +736,11 @@ def mutate(ind: Individual, batches: List[Batch],
         return
 
     op = random.random()
+    cum_add = p_add
+    cum_del = cum_add + p_del
+    cum_mod = cum_del + p_mod
 
-    # 1) 局部扰动
-    if op < p_local and len(allocs) >= 2:
-        a1, a2 = random.sample(allocs, 2)
-        max_delta = 0.3 * a1.share
-        if max_delta > 0:
-            delta = random.random() * max_delta
-            a1.share -= delta
-            a2.share += delta
-
-    # 2) 引入新路径
-    elif op < p_local + p_add:
+    if op < cum_add:
         used = {a.path_id for a in allocs}
         candidates = [p for p in paths if p.path_id not in used]
         if candidates:
@@ -827,11 +750,35 @@ def mutate(ind: Individual, batches: List[Batch],
                 a.share *= (1 - delta)
             allocs.append(PathAllocation(new_p.path_id, delta))
 
-    # 3) 删除弱路径
-    else:
+    elif op < cum_del:
         if len(allocs) > 1:
-            allocs.sort(key=lambda a: a.share)
-            allocs.pop(0)
+            rm = random.choice(allocs)
+            allocs = [a for a in allocs if a.path_id != rm.path_id]
+
+    elif op < cum_mod:
+        if len(allocs) >= 2:
+            a1, a2 = random.sample(allocs, 2)
+            max_delta = 0.3 * a1.share
+            if max_delta > 0:
+                delta = random.random() * max_delta
+                a1.share -= delta
+                a2.share += delta
+
+    else:
+        used = {a.path_id for a in allocs}
+        if len(used) < len(paths):
+            victim = random.choice(allocs)
+            candidates = [p for p in paths if p.path_id not in used]
+            if candidates:
+                new_p = random.choice(candidates)
+                victim.path_id = new_p.path_id
+
+        if allocs:
+            L = len(allocs)
+            alphas = np.ones(L)
+            new_shares = np.random.dirichlet(alphas)
+            for a, s in zip(allocs, new_shares):
+                a.share = float(s)
 
     ind.od_allocations[od] = allocs
     fix_shares_for_all_ods(ind)
@@ -847,7 +794,6 @@ def repair(ind: Individual,
     fix_shares_for_all_ods(ind)
     capacity_violations, path_tardy = evaluate_individual(ind, batches, path_lib, arcs, timetables)
 
-    # 容量修复：对超载的 arc-slot 等比例缩小对应路径的 share
     for v in capacity_violations:
         arc = v["arc"]
         slot = v["slot"]
@@ -869,7 +815,6 @@ def repair(ind: Individual,
                 if a.path_id == path_id:
                     a.share *= scale
 
-    # 迟到修复：将迟到路径的 share 分配到同 OD 的非迟到路径上
     if path_tardy:
         for (batch_id, path_id) in list(path_tardy.keys()):
             batch = next(b for b in batches if b.batch_id == batch_id)
@@ -990,7 +935,7 @@ def tournament_select(pop: List[Individual],
 
 
 # ========================
-# 构造式“可行”个体 + 初始种群
+# 初始种群构造
 # ========================
 
 def constructive_feasible_individual(batches: List[Batch],
@@ -1000,12 +945,7 @@ def constructive_feasible_individual(batches: List[Batch],
                                      share_step: float = 0.1,
                                      topK_paths: int = 8,
                                      cost_slack: float = 0.2) -> Individual:
-    """
-    构造一个“尽量可行”的个体：
-    - 每个 OD 的批次按 share_step 拆成 M 份；
-    - 每份优先放到成本较低且可行的路径上；
-    - 提交前用 try_commit_flow 做容量+LT 检查。
-    """
+
     ind = Individual()
     arc_index = build_arc_index(arcs)
     arc_flow_by_time: Dict[Tuple[str, str, str, int], float] = {}
@@ -1115,9 +1055,6 @@ def print_solution_detail(ind: Individual,
                           path_lib: Dict[Tuple[str, str], List[Path]],
                           sol_name: str = "Solution",
                           file=None):
-    """
-    输出个体在各 OD 上的路径拆分结构。
-    """
 
     def out(line: str = ""):
         if file is not None:
@@ -1297,9 +1234,6 @@ def run_nsga2(filename="data.xlsx",
     for i, ind in enumerate(pareto):
         f1, f2, f3 = ind.objectives
         print(f"Sol {i}: cost={f1:.2f}, emission={f2:.2f}, time={f3:.2f}")
-
-    for i, ind in enumerate(pareto[:3]):
-        print_solution_detail(ind, batches, path_lib, sol_name=f"Pareto 解 {i}")
 
     with open("results.txt", "w", encoding="utf-8") as f:
         f.write("Final Pareto front:\n")
