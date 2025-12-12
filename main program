@@ -13,14 +13,19 @@ import matplotlib.cm as cm
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
-# ---- Global config ----
+# ========================
+# 全局设置
+# ========================
 
-TIME_BUCKET_H = 1.0  # 时间步长（小时）
+TIME_BUCKET_H = 1.0  # 仿真时间粒度：1小时
 CHINA_REGIONS = {"CN", "China"}
 EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
+BIG_M = 1e6  # 容量惩罚的大常数
 
 
-# ---- 1. 数据结构 ----
+# ========================
+# 1. 数据结构定义
+# ========================
 
 @dataclass
 class Arc:
@@ -28,7 +33,7 @@ class Arc:
     to_node: str
     mode: str
     distance: float
-    capacity: float       # 单位：TEU / TimeBucket（如 TEU/小时）
+    capacity: float       # 单位：TEU / TimeBucket (例如 TEU/小时)
     cost_per_teu_km: float
     emission_per_teu_km: float
     speed_kmh: float
@@ -92,15 +97,18 @@ class PathAllocation:
 
 @dataclass(eq=False)
 class Individual:
-    # key: (origin, dest), value: List[PathAllocation]
-    od_allocations: Dict[Tuple[str, str], List[PathAllocation]] = field(default_factory=dict)
-    # objectives: (Cost, Emission, Time)
+    # (origin, dest, batch_id)
+    od_allocations: Dict[Tuple[str, str, int], List[PathAllocation]] = field(default_factory=dict)
+    # Objectives: Cost, Emission, Time
     objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
+    # 约束相关
     penalty: float = 0.0
     feasible: bool = False
 
 
-# ---- 2. 去重与归一化 ----
+# ========================
+# 2. 核心逻辑：去重与归一化
+# ========================
 
 def clone_gene(alloc: PathAllocation) -> PathAllocation:
     return PathAllocation(path=alloc.path, share=alloc.share)
@@ -110,7 +118,7 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
     if not allocs:
         return []
 
-    # 合并结构相同的路径
+    # 合并相同结构的路径
     merged_map: Dict[Path, float] = {}
     for a in allocs:
         if a.path not in merged_map:
@@ -120,7 +128,7 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
 
     unique_allocs = [PathAllocation(path=p, share=s) for p, s in merged_map.items()]
 
-    # 归一化到和为 1
+    # 归一化
     total_share = sum(a.share for a in unique_allocs)
 
     if total_share <= 1e-9:
@@ -134,10 +142,10 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
         for a in unique_allocs:
             a.share *= factor
 
-    # 去掉非常小的份额
+    # 过滤微小份额
     unique_allocs = [a for a in unique_allocs if a.share > 0.001]
 
-    # 再调整一次，保证总和接近 1
+    # 二次修正，保证总和 ≈ 1
     if unique_allocs:
         final_total = sum(a.share for a in unique_allocs)
         if abs(final_total - 1.0) > 1e-6:
@@ -147,7 +155,9 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
     return unique_allocs
 
 
-# ---- 3. 数据读取与图构建 ----
+# ========================
+# 3. 数据读取与图构建
+# ========================
 
 def load_network_from_extended(filename: str):
     try:
@@ -166,7 +176,7 @@ def load_network_from_extended(filename: str):
     arcs_df = pd.read_excel(xls, "Arcs_All")
     arcs: List[Arc] = []
 
-    # Excel 中的 Capacity 视为 TEU/Day，转换为 TEU/TimeBucket
+    # 假设 Excel 中的 Capacity 是 TEU/Day，需要转换成 TEU/TimeBucket
     DAILY_HOURS = 24.0
 
     for _, row in arcs_df.iterrows():
@@ -178,6 +188,7 @@ def load_network_from_extended(filename: str):
         cleaned = "".join(ch for ch in dist_str if (ch.isdigit() or ch == "."))
         distance = float(cleaned) if cleaned else 0.0
 
+        # 容量：从 TEU/Day 转换为 TEU/TimeBucket
         if "Capacity_TEU" in arcs_df.columns and not pd.isna(row["Capacity_TEU"]):
             raw_cap = float(row["Capacity_TEU"])
         else:
@@ -220,7 +231,7 @@ def load_network_from_extended(filename: str):
             headway_hours=hd
         ))
 
-    # Batches：只保留中欧向的批次
+    # Batches
     bdf = pd.read_excel(xls, "Batches")
     batches: List[Batch] = []
     for _, row in bdf.iterrows():
@@ -251,7 +262,7 @@ def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
 
 
 def build_timetable_dict(timetables: List[TimetableEntry]) -> Dict[Tuple[str, str, str], List[TimetableEntry]]:
-    """时刻表转为字典形式，加速查询。"""
+    """将时刻表预处理为字典，加速查询。"""
     tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]] = {}
     for t in timetables:
         key = (t.from_node, t.to_node, t.mode)
@@ -313,24 +324,27 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
 
         if paths_for_od:
             paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
-            path_lib[od] = paths_for_od[:20]  # 每个 OD 保留前 20 条
+            path_lib[od] = paths_for_od[:20]  # 保留前20条路径
 
     return path_lib
 
 
-# ---- 4. 评估逻辑（目标 + 约束） ----
+# ========================
+# 4. 评估逻辑（目标 + 可行性检查）
+# ========================
 
 def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
                                 arc_flow_map) -> float:
     """
-    按 ET 出发，沿 path 仿真时间与容量占用。
-    - road: 随到随走（不看时刻表）
-    - rail / water: 按 timetable 等下一班
+    按批次ET出发，沿path仿真时间与容量占用。
+    - Road: 随到随走 (不看时刻表)
+    - Rail / Water: 按 Timetable 等下一班
     """
     t = batch.ET
     for arc in path.arcs:
         travel_time = arc.distance / max(arc.speed_kmh, 1.0)
 
+        # 公路：强制不看时刻表，随到随走
         if arc.mode == "road":
             entries = []
         else:
@@ -340,6 +354,7 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
         if not entries:
             dep = t
         else:
+            # 简化：只用第一条时刻信息
             e = entries[0]
             if t <= e.first_departure_hour:
                 dep = e.first_departure_hour
@@ -350,7 +365,7 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
 
         arr = dep + travel_time
 
-        # 容量按出发时间所在的时间桶统计
+        # 记录容量占用（以出发时间所在的 Time Bucket 为粒度）
         start_slot = int(dep)
         key = (arc.from_node, arc.to_node, arc.mode)
         slot_key = (key, start_slot)
@@ -358,7 +373,7 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
 
         t = arr
 
-    # 返回相对 ET 的总旅行时间
+    # 返回总旅行时间（相对于ET）
     return t - batch.ET
 
 
@@ -372,16 +387,18 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
     penalty = 0.0
 
+    # 约束违背标记
     missing_alloc_violation = False
     late_violation = False
     capacity_violation = False
 
     for batch in batches:
-        od = (batch.origin, batch.destination)
-        allocs = ind.od_allocations.get(od, [])
+        # 按 (O,D,batch_id) 取编码
+        key = (batch.origin, batch.destination, batch.batch_id)
+        allocs = ind.od_allocations.get(key, [])
 
         if not allocs:
-            # 未为该批次分配路径 → 直接惩罚
+            # 没有为该批次分配路径 → 严重不可行
             penalty += 1e9
             missing_alloc_violation = True
             continue
@@ -403,49 +420,54 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
             batch_finish_time = max(batch_finish_time, arrival_time)
 
-            # 软时间窗：晚到部分加罚
+            # 软时间窗惩罚：这里也当成“可行性条件”
             if arrival_time > batch.LT:
                 penalty += (arrival_time - batch.LT) * 1000.0
                 late_violation = True
 
         makespan = max(makespan, batch_finish_time)
 
-    # 容量约束：超出部分加罚
+    # 容量约束惩罚：按（弧, 时间桶）检查
     for (key, slot), flow in arc_flow_map.items():
         cap = arc_caps.get(key, 1e9)
         if flow > cap:
-            penalty += (flow - cap) * 5000.0
+            penalty += (flow - cap) * BIG_M
             capacity_violation = True
 
     ind.objectives = (total_cost + penalty,
                       total_emission + penalty,
                       makespan)
     ind.penalty = penalty
+    # 所有约束都满足才算可行
     ind.feasible = not (missing_alloc_violation or late_violation or capacity_violation)
 
 
-# ---- 5. 遗传算子 ----
+# ========================
+# 5. 遗传算子
+# ========================
 
 def crossover_structural(ind1: Individual, ind2: Individual,
                          batches: List[Batch]) -> Tuple[Individual, Individual]:
-    """结构+份额的片段交叉，交叉后用 merge_and_normalize 修 share。"""
+    """结构+份额的片段交叉，交叉后用 merge_and_normalize 修复 share。
+       现在以 (origin,destination,batch_id) 为 key，对每个批次单独交叉。
+    """
     child1 = Individual()
     child2 = Individual()
 
     for batch in batches:
-        od = (batch.origin, batch.destination)
-        genes1 = ind1.od_allocations.get(od, [])
-        genes2 = ind2.od_allocations.get(od, [])
+        key = (batch.origin, batch.destination, batch.batch_id)
+        genes1 = ind1.od_allocations.get(key, [])
+        genes2 = ind2.od_allocations.get(key, [])
 
         if not genes1 and not genes2:
             continue
         if not genes1:
-            child1.od_allocations[od] = [clone_gene(g) for g in genes2]
-            child2.od_allocations[od] = [clone_gene(g) for g in genes2]
+            child1.od_allocations[key] = [clone_gene(g) for g in genes2]
+            child2.od_allocations[key] = [clone_gene(g) for g in genes2]
             continue
         if not genes2:
-            child1.od_allocations[od] = [clone_gene(g) for g in genes1]
-            child2.od_allocations[od] = [clone_gene(g) for g in genes1]
+            child1.od_allocations[key] = [clone_gene(g) for g in genes1]
+            child2.od_allocations[key] = [clone_gene(g) for g in genes1]
             continue
 
         cut1 = random.randint(0, len(genes1))
@@ -456,8 +478,8 @@ def crossover_structural(ind1: Individual, ind2: Individual,
         c2_genes = [clone_gene(g) for g in genes2[:cut2]] + \
                    [clone_gene(g) for g in genes1[cut1:]]
 
-        child1.od_allocations[od] = merge_and_normalize(c1_genes)
-        child2.od_allocations[od] = merge_and_normalize(c2_genes)
+        child1.od_allocations[key] = merge_and_normalize(c1_genes)
+        child2.od_allocations[key] = merge_and_normalize(c2_genes)
 
     return child1, child2
 
@@ -465,16 +487,20 @@ def crossover_structural(ind1: Individual, ind2: Individual,
 def mutate_structural(ind: Individual, batches: List[Batch],
                       path_lib: Dict[Tuple[str, str], List[Path]],
                       p_add=0.2, p_del=0.3, p_mod=0.5):
-    """结构变异：添加/删除路径或调整 share，再归一化。"""
+    """结构型变异：增加/删除路径，或者调整 share，再归一化。
+       现在随机选一个批次，对该批次的编码做变异。
+    """
     batch = random.choice(batches)
     od = (batch.origin, batch.destination)
-    allocs = ind.od_allocations.get(od, [])
+    key = (batch.origin, batch.destination, batch.batch_id)
+
+    allocs = ind.od_allocations.get(key, [])
     paths_in_lib = path_lib.get(od, [])
 
     if not paths_in_lib:
         return
 
-    # Add
+    # Add：添加新路径
     if random.random() < p_add:
         current_structures = {a.path for a in allocs}
         candidates = [p for p in paths_in_lib if p not in current_structures]
@@ -482,20 +508,22 @@ def mutate_structural(ind: Individual, batches: List[Batch],
             new_path = random.choice(candidates)
             allocs.append(PathAllocation(path=new_path, share=0.2))
 
-    # Del
+    # Del：删除一个路径
     if random.random() < p_del:
         if len(allocs) > 1:
             allocs.pop(random.randint(0, len(allocs) - 1))
 
-    # Mod
+    # Mod：修改 share
     if random.random() < p_mod and allocs:
         target = random.choice(allocs)
         target.share *= random.uniform(0.5, 1.5)
 
-    ind.od_allocations[od] = merge_and_normalize(allocs)
+    ind.od_allocations[key] = merge_and_normalize(allocs)
 
 
-# ---- 6. 工具：Hypervolume & 去重 ----
+# ========================
+# 6. 工具类：Hypervolume 计算 & 解去重
+# ========================
 
 class HypervolumeCalculator:
     def __init__(self, ref_point: Tuple[float, float, float], num_samples=10000):
@@ -510,13 +538,15 @@ class HypervolumeCalculator:
         self.total_volume = float(np.prod(self.ref_point))
 
     def calculate(self, pareto_front_inds: List[Individual]) -> float:
-        """相对于 ref_point 的近似超体积（0–1）。"""
+        """
+        返回相对于 ref_point 定义的“归一化超体积”（0–1）。
+        """
         if not pareto_front_inds:
             return 0.0
 
         front_objs = np.array([ind.objectives for ind in pareto_front_inds], dtype=float)
 
-        # 只保留位于参考盒子内的解
+        # 只保留在 ref_point 盒子内的解
         valid_mask = np.all(front_objs <= self.ref_point, axis=1)
         valid_objs = front_objs[valid_mask]
         if len(valid_objs) == 0:
@@ -525,7 +555,7 @@ class HypervolumeCalculator:
         S = self.samples[:, np.newaxis, :]   # (Samples, 1, 3)
         O = valid_objs[np.newaxis, :, :]     # (1, FrontSize, 3)
 
-        is_dominated = np.all(O <= S, axis=2)
+        is_dominated = np.all(O <= S, axis=2)      # (Samples, FrontSize)
         dominated_samples = np.any(is_dominated, axis=1)
 
         ratio = np.sum(dominated_samples) / float(self.num_samples)
@@ -535,7 +565,8 @@ class HypervolumeCalculator:
 def unique_individuals_by_objectives(front: List[Individual],
                                      tol: float = 1e-3) -> List[Individual]:
     """
-    按目标值去重：三个目标差值都在 tol 内视为同一解。
+    按目标值去重：如果两个解在三个目标上都足够接近（差值 <= tol），
+    就认为是同一个解，只保留第一个。
     """
     unique: List[Individual] = []
     seen_objs: List[Tuple[float, float, float]] = []
@@ -556,7 +587,9 @@ def unique_individuals_by_objectives(front: List[Individual],
     return unique
 
 
-# ---- 7. NSGA-II 主流程 ----
+# ========================
+# 7. NSGA-II 逻辑 (带可行性 & 记录)
+# ========================
 
 def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
     ind = Individual()
@@ -570,15 +603,17 @@ def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
         chosen = random.sample(paths, k)
         raw_allocs = [PathAllocation(path=p, share=random.random())
                       for p in chosen]
-        ind.od_allocations[od] = merge_and_normalize(raw_allocs)
+
+        key = (batch.origin, batch.destination, batch.batch_id)
+        ind.od_allocations[key] = merge_and_normalize(raw_allocs)
     return ind
 
 
 def dominates(a: Individual, b: Individual) -> bool:
     """
     约束支配：
-    - 可行解优于不可行解；
-    - 同为可行/不可行时使用标准支配关系。
+    - 可行解总是优于不可行解；
+    - 两者同为可行或不可行时，回到标准多目标支配关系。
     """
     if a.feasible and not b.feasible:
         return True
@@ -664,14 +699,14 @@ def run_nsga2_analytics(filename="data.xlsx",
     print("Building path library...")
     path_lib = build_path_library(node_names, arcs, batches, timetables)
 
-    # 初始种群
+    # 1. 初始种群
     population: List[Individual] = []
     for _ in range(pop_size):
         ind = random_initial_individual(batches, path_lib)
         evaluate_individual(ind, batches, path_lib, arcs, tt_dict)
         population.append(ind)
 
-    # HV 参考点：初始种群最大值的 1.2 倍
+    # 2. HV 参考点：根据初始种群的最大值放大 1.2 倍
     all_objs = np.array([ind.objectives for ind in population], dtype=float)
     max_vals = np.max(all_objs, axis=0)
     ref_point = max_vals * 1.2
@@ -686,13 +721,14 @@ def run_nsga2_analytics(filename="data.xlsx",
         fronts = non_dominated_sort(population)
         front0 = fronts[0]
 
-        # 优先使用可行解
+        # 优先使用可行解，如果该前沿中还没有可行解，则退回使用原前沿
         feasible_front0 = [ind for ind in front0 if ind.feasible]
         base_front = feasible_front0 if feasible_front0 else front0
 
-        # 当前前沿去重
+        # 对当前前沿去重
         front0_unique = unique_individuals_by_objectives(base_front, tol=1e-3)
 
+        # 记录当前 Pareto Front 0 的目标值
         current_front_objs = [ind.objectives for ind in front0_unique]
         history_fronts.append((gen, current_front_objs))
 
@@ -703,7 +739,7 @@ def run_nsga2_analytics(filename="data.xlsx",
         print(f"Gen {gen}: Best Cost={best_f1:.0f}, "
               f"Front Size={len(front0_unique)}, HV={current_hv:.4f}")
 
-        # rank & crowding distance
+        # 计算 rank & crowding distance
         ranks: Dict[Individual, int] = {}
         for r, front in enumerate(fronts):
             for ind in front:
@@ -761,17 +797,19 @@ def run_nsga2_analytics(filename="data.xlsx",
     return population, pareto_front, batches, history_fronts, hv_history
 
 
-# ---- 8. 绘图与输出 ----
+# ========================
+# 8. 绘图与输出
+# ========================
 
 def print_pure_structure(ind: Individual, batches: List[Batch], sol_name="Solution"):
-    print(f"\n===== {sol_name} 结构 (Node+Mode | Share) =====")
+    print(f"\n===== {sol_name} 最终结构 (Node+Mode | Share) =====")
     for batch in batches:
-        od = (batch.origin, batch.destination)
-        allocs = ind.od_allocations.get(od, [])
+        key = (batch.origin, batch.destination, batch.batch_id)
+        allocs = ind.od_allocations.get(key, [])
         if not allocs:
             continue
 
-        print(f"\nOD: {batch.origin} -> {batch.destination}\n")
+        print(f"\nBatch {batch.batch_id}: {batch.origin} -> {batch.destination}, Q={batch.quantity}\n")
         for a in allocs:
             print(a)
 
@@ -780,7 +818,8 @@ def save_pareto_solutions(pareto: List[Individual],
                           batches: List[Batch],
                           filename: str = "result.txt"):
     """
-    将当前 Pareto 前沿上的解保存到 txt 文件（先按目标值去重）。
+    将当前 Pareto 前沿上的所有解保存到 txt 文件中。
+    先按目标值去重，再写入文件。
     """
     pareto = unique_individuals_by_objectives(pareto, tol=1e-3)
 
@@ -794,12 +833,12 @@ def save_pareto_solutions(pareto: List[Individual],
                     f"Penalty={ind.penalty:.2f}, Feasible={ind.feasible}\n\n")
 
             for batch in batches:
-                od = (batch.origin, batch.destination)
-                allocs = ind.od_allocations.get(od, [])
+                key = (batch.origin, batch.destination, batch.batch_id)
+                allocs = ind.od_allocations.get(key, [])
                 if not allocs:
                     continue
 
-                f.write(f"OD: {batch.origin} -> {batch.destination}\n\n")
+                f.write(f"Batch {batch.batch_id}: {batch.origin} -> {batch.destination}, Q={batch.quantity}\n\n")
                 for a in allocs:
                     f.write(str(a) + "\n")
                 f.write("\n")
@@ -810,11 +849,13 @@ def save_pareto_solutions(pareto: List[Individual],
 
 
 def plot_results(history_fronts, hv_history):
+    # 创建画布
     fig = plt.figure(figsize=(18, 8))
 
-    # 1. 3D Pareto Front 演化
+    # === 1. 3D Pareto Front Evolution ===
     ax1 = fig.add_subplot(121, projection='3d')
     num_gens = len(history_fronts)
+
     colors = cm.viridis(np.linspace(0, 1, num_gens))
 
     for gen, objs in history_fronts:
@@ -840,7 +881,7 @@ def plot_results(history_fronts, hv_history):
     ax1.set_title('Pareto Front Evolution (Color=Generation)')
     ax1.legend()
 
-    # 2. Hypervolume 收敛曲线
+    # === 2. Hypervolume Convergence ===
     ax2 = fig.add_subplot(122)
     ax2.plot(range(len(hv_history)),
              hv_history,
@@ -854,18 +895,22 @@ def plot_results(history_fronts, hv_history):
 
     plt.tight_layout()
 
+    # 视图 1: 标准视角
     ax1.view_init(elev=30, azim=45)
     plt.savefig('nsga2_view_1_std.png', dpi=300)
     print("Saved view 1 (Standard): nsga2_view_1_std.png")
 
+    # 视图 2: 侧面视角 (看 Cost vs Time)
     ax1.view_init(elev=20, azim=135)
     plt.savefig('nsga2_view_2_side.png', dpi=300)
     print("Saved view 2 (Side): nsga2_view_2_side.png")
 
+    # 视图 3: 俯视视角 (看 Cost vs Emission)
     ax1.view_init(elev=60, azim=45)
     plt.savefig('nsga2_view_3_top.png', dpi=300)
     print("Saved view 3 (Top-down): nsga2_view_3_top.png")
 
+    # 视图 4: 另一个侧面 (看 Emission vs Time)
     ax1.view_init(elev=25, azim=210)
     plt.savefig('nsga2_view_4_other.png', dpi=300)
     print("Saved view 4 (Other): nsga2_view_4_other.png")
@@ -873,10 +918,12 @@ def plot_results(history_fronts, hv_history):
     plt.show()
 
 
-# ---- 9. 典型 Pareto 解的分析 ----
+# ========================
+# 9. 典型 Pareto 解的可视化相关函数
+# ========================
 
 def normalise_objectives(pareto: List[Individual]):
-    """在当前 Pareto 集内部做 0–1 归一化。"""
+    """在当前 Pareto 集内部做 0-1 归一化。"""
     objs = np.array([ind.objectives for ind in pareto], dtype=float)
     mins = objs.min(axis=0)
     maxs = objs.max(axis=0)
@@ -888,8 +935,8 @@ def normalise_objectives(pareto: List[Individual]):
 def select_weighted_solution(pareto: List[Individual],
                              weights=(0.4, 0.3, 0.3)) -> Tuple[Individual, float]:
     """
-    在 Pareto 集内做归一化 + 加权和，选一条“代表解”。
-    weights: (w_cost, w_emission, w_time)。
+    在 Pareto 集内做归一化 + 加权和，选出一条“典型解”。
+    weights: (w_cost, w_emission, w_time)，越小越好。
     """
     norm_objs, mins, maxs = normalise_objectives(pareto)
     w = np.array(weights, dtype=float)
@@ -902,17 +949,17 @@ def select_weighted_solution(pareto: List[Individual],
 
 def analyse_solution_modes(ind: Individual, batches: List[Batch]) -> Dict[str, float]:
     """
-    统计该解中各 mode 的 TEU·km。
+    统计该解中各 mode 的 TEU·km，用于画柱状图。
     """
     mode_flow: Dict[str, float] = {}
     for batch in batches:
-        od = (batch.origin, batch.destination)
-        allocs = ind.od_allocations.get(od, [])
+        key = (batch.origin, batch.destination, batch.batch_id)
+        allocs = ind.od_allocations.get(key, [])
         for a in allocs:
             flow = a.share * batch.quantity
             for arc in a.path.arcs:
-                key = arc.mode
-                mode_flow[key] = mode_flow.get(key, 0.0) + flow * arc.distance
+                k = arc.mode
+                mode_flow[k] = mode_flow.get(k, 0.0) + flow * arc.distance
     return mode_flow
 
 
@@ -940,6 +987,7 @@ def plot_radar_for_solution(ind: Individual, pareto: List[Individual],
     """
     norm_objs, mins, maxs = normalise_objectives(pareto)
     objs = np.array([p.objectives for p in pareto], dtype=float)
+    # 找到与该解目标值最接近的索引
     target = np.array(ind.objectives, dtype=float)
     idx = int(np.argmin(np.linalg.norm(objs - target, axis=1)))
     val = norm_objs[idx]
@@ -961,13 +1009,15 @@ def plot_radar_for_solution(ind: Individual, pareto: List[Individual],
     print(f"Saved radar figure: {filename}")
 
 
-# ---- 10. 多次实验：HV 统计 ----
+# ========================
+# 10. 多次实验：至少 30 组取平均
+# ========================
 
 if __name__ == "__main__":
     filename = "data.xlsx"
     pop_size = 60
-    generations = 200
-    runs = 30
+    generations = 200     # 你现在用 200 代
+    runs = 30             # 至少 30 组
 
     all_final_hv: List[float] = []
     best_run_idx = -1
@@ -979,7 +1029,7 @@ if __name__ == "__main__":
     best_hv_history = None
 
     for run_id in range(runs):
-        # 不同随机种子，保证多次实验相互独立
+        # 每次设置不同随机种子，保证独立实验
         seed = 1000 + run_id
         random.seed(seed)
         np.random.seed(seed)
@@ -996,7 +1046,7 @@ if __name__ == "__main__":
         print(f"[RUN {run_id}] Final HV = {final_hv:.4f}, "
               f"Pareto size = {len(pareto)}")
 
-        # 记录 HV 最好的那次
+        # 记录 HV 最好的那次，用于后续打印、保存和画图
         if final_hv > best_run_hv:
             best_run_hv = final_hv
             best_run_idx = run_id
@@ -1017,7 +1067,7 @@ if __name__ == "__main__":
     print(f"Best run HV    : {best_run_hv:.4f}")
     print("=========================================\n")
 
-    # 用 HV 最好的那一轮的结果做结构打印、保存和画图
+    # 用 HV 最好的那一轮 run 的结果做结构打印、保存和画图
     if best_pareto is not None:
         # 1）打印前三个 Pareto 解
         for i, ind in enumerate(best_pareto[:3]):
@@ -1029,7 +1079,7 @@ if __name__ == "__main__":
         # 3）绘制整体收敛图 / Pareto 演化
         plot_results(best_history_fronts, best_hv_history)
 
-        # 4）基于 (0.4, 0.3, 0.3) 选一个“代表解”，并可视化
+        # 4）基于 (0.4, 0.3, 0.3) 选一个“典型解”，并可视化
         typical_ind, typical_score = select_weighted_solution(
             best_pareto, weights=(0.4, 0.3, 0.3)
         )
