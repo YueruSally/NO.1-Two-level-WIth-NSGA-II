@@ -121,8 +121,7 @@ class Individual:
 # 2. Core: merge & normalize shares
 # ========================
 
-def clone_gene(alloc: PathAllocation) -> PathAllocation:
-    return PathAllocation(path=alloc.path, share=alloc.share)
+
 
 
 def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
@@ -468,40 +467,182 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 # 5. Genetic operators
 # ========================
 
-def crossover_structural(ind1: Individual, ind2: Individual,
-                         batches: List[Batch]) -> Tuple[Individual, Individual]:
-    """Segment crossover per batch; fix shares by merge_and_normalize."""
-    child1 = Individual()
-    child2 = Individual()
+def are_individuals_identical(genes1, genes2) -> bool:
+    if len(genes1) != len(genes2):
+        return False
+    return all(g1 == g2 for g1, g2 in zip(genes1, genes2))
 
-    for batch in batches:
-        key = (batch.origin, batch.destination, batch.batch_id)
-        genes1 = ind1.od_allocations.get(key, [])
-        genes2 = ind2.od_allocations.get(key, [])
 
-        if not genes1 and not genes2:
+def find_allocation_index(allocations: List['PathAllocation'],
+                          target: 'PathAllocation') -> int:
+    for i, alloc in enumerate(allocations):
+        if alloc == target:
+            return i
+    return None
+
+
+def find_common_intermediate_nodes(path1_nodes, path2_nodes):
+    if not path1_nodes or not path2_nodes:
+        return []
+    intermediate1 = set(path1_nodes[1:-1])
+    intermediate2 = set(path2_nodes[1:-1])
+    return list(intermediate1.intersection(intermediate2))
+
+
+def perform_single_point_crossover(alloc1, alloc2, common_node):
+    path1 = alloc1.path
+    path2 = alloc2.path
+
+    idx1 = path1.nodes.index(common_node)
+    idx2 = path2.nodes.index(common_node)
+
+    new_nodes1 = path1.nodes[:idx1] + path2.nodes[idx2:]
+    new_nodes2 = path2.nodes[:idx2] + path1.nodes[idx1:]
+
+    new_modes1 = path1.modes[:idx1] + path2.modes[idx2:]
+    new_modes2 = path2.modes[:idx2] + path1.modes[idx1:]
+
+    new_path1 = Path(
+        path_id=-1,
+        origin=path1.origin,
+        destination=path1.destination,
+        nodes=new_nodes1,
+        modes=new_modes1,
+        arcs=[],
+        base_cost_per_teu=0.0,
+        base_emission_per_teu=0.0,
+        base_travel_time_h=0.0
+    )
+
+    new_path2 = Path(
+        path_id=-1,
+        origin=path2.origin,
+        destination=path2.destination,
+        nodes=new_nodes2,
+        modes=new_modes2,
+        arcs=[],
+        base_cost_per_teu=0.0,
+        base_emission_per_teu=0.0,
+        base_travel_time_h=0.0
+    )
+
+    return (PathAllocation(path=new_path1, share=alloc1.share),
+            PathAllocation(path=new_path2, share=alloc2.share))
+
+
+def basic_path_repair(alloc):
+    nodes = alloc.path.nodes
+    modes = alloc.path.modes
+
+    seen = set()
+    unique_nodes = []
+    unique_modes = []
+
+    for i, node in enumerate(nodes):
+        if node not in seen:
+            seen.add(node)
+            unique_nodes.append(node)
+            if i < len(modes):
+                unique_modes.append(modes[i])
+
+    if unique_nodes[0] != alloc.path.origin:
+        unique_nodes.insert(0, alloc.path.origin)
+        if unique_modes:
+            unique_modes.insert(0, unique_modes[0])
+
+    if unique_nodes[-1] != alloc.path.destination:
+        unique_nodes.append(alloc.path.destination)
+        if unique_modes:
+            unique_modes.append(unique_modes[-1])
+
+    repaired_path = Path(
+        path_id=alloc.path.path_id,
+        origin=alloc.path.origin,
+        destination=alloc.path.destination,
+        nodes=unique_nodes,
+        modes=unique_modes,
+        arcs=alloc.path.arcs,
+        base_cost_per_teu=alloc.path.base_cost_per_teu,
+        base_emission_per_teu=alloc.path.base_emission_per_teu,
+        base_travel_time_h=alloc.path.base_travel_time_h
+    )
+
+    return PathAllocation(path=repaired_path, share=alloc.share)
+
+
+def crossover(ind1: 'Individual', ind2: 'Individual',
+              batches: List['Batch']) -> Tuple['Individual', 'Individual']:
+
+    child1 = deepcopy(ind1)
+    child2 = deepcopy(ind2)
+
+    batch_keys = [(batch.origin, batch.destination, batch.batch_id)
+                  for batch in batches]
+    random.shuffle(batch_keys)
+
+    crossed = False
+
+    for key in batch_keys:
+        allocs1 = ind1.od_allocations.get(key, [])
+        allocs2 = ind2.od_allocations.get(key, [])
+
+        if not allocs1 or not allocs2:
             continue
-        if not genes1:
-            child1.od_allocations[key] = [clone_gene(g) for g in genes2]
-            child2.od_allocations[key] = [clone_gene(g) for g in genes2]
-            continue
-        if not genes2:
-            child1.od_allocations[key] = [clone_gene(g) for g in genes1]
-            child2.od_allocations[key] = [clone_gene(g) for g in genes1]
+
+        if are_individuals_identical(allocs1, allocs2):
             continue
 
-        cut1 = random.randint(0, len(genes1))
-        cut2 = random.randint(0, len(genes2))
+        common_node_candidates = []
 
-        c1_genes = [clone_gene(g) for g in genes1[:cut1]] + \
-                   [clone_gene(g) for g in genes2[cut2:]]
-        c2_genes = [clone_gene(g) for g in genes2[:cut2]] + \
-                   [clone_gene(g) for g in genes1[cut1:]]
+        for alloc1 in allocs1:
+            for alloc2 in allocs2:
+                common_nodes = find_common_intermediate_nodes(
+                    alloc1.path.nodes,
+                    alloc2.path.nodes
+                )
+                if common_nodes:
+                    for node in common_nodes:
+                        common_node_candidates.append({
+                            'alloc1': alloc1,
+                            'alloc2': alloc2,
+                            'common_node': node
+                        })
 
-        child1.od_allocations[key] = merge_and_normalize(c1_genes)
-        child2.od_allocations[key] = merge_and_normalize(c2_genes)
+        if common_node_candidates:
+            candidate = random.choice(common_node_candidates)
+
+            new_alloc1, new_alloc2 = perform_single_point_crossover(
+                candidate['alloc1'],
+                candidate['alloc2'],
+                candidate['common_node']
+            )
+
+            idx1 = find_allocation_index(allocs1, candidate['alloc1'])
+            idx2 = find_allocation_index(allocs2, candidate['alloc2'])
+
+            if idx1 is not None and idx2 is not None:
+                new_allocs1 = deepcopy(allocs1)
+                new_allocs2 = deepcopy(allocs2)
+
+                new_allocs1[idx1] = basic_path_repair(new_alloc1)
+                new_allocs2[idx2] = basic_path_repair(new_alloc2)
+
+                child1.od_allocations[key] = new_allocs1
+                child2.od_allocations[key] = new_allocs2
+
+                crossed = True
+                break
+
+    if not crossed:
+        if batch_keys:
+            random_key = random.choice(batch_keys)
+            if (random_key in child1.od_allocations and
+                    random_key in child2.od_allocations):
+                child1.od_allocations[random_key], child2.od_allocations[random_key] = \
+                    child2.od_allocations[random_key], child1.od_allocations[random_key]
 
     return child1, child2
+
 
 
 def mutate_structural(ind: Individual, batches: List[Batch],
@@ -822,7 +963,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
         while len(offspring) < pop_size:
             if random.random() < 0.7:
                 p1, p2 = random.sample(mating_pool, 2)
-                c1, c2 = crossover_structural(p1, p2, batches)
+                c1, c2 = crossover(p1, p2, batches)
             else:
                 c1 = random_initial_individual(batches, path_lib)
                 c2 = random_initial_individual(batches, path_lib)
