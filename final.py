@@ -59,7 +59,7 @@ class Batch:
     destination: str
     quantity: float
     ET: float
-    LT: float  # NOTE: treated as hard constraint via infeasible flag + INFEASIBLE_PENALTY
+    LT: float  # treated as hard constraint via infeasible flag + INFEASIBLE_PENALTY
 
 
 @dataclass
@@ -120,9 +120,6 @@ class Individual:
 # ========================
 # 2. Core: merge & normalize shares
 # ========================
-
-
-
 
 def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
     if not allocs:
@@ -325,8 +322,7 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
             next_path_id += 1
 
         if paths_for_od:
-            # ===== Diversity-preserving selection (FIX) =====
-            # Take best by cost/time/emission + random fill
+            # Diversity-preserving selection
             K_cost = 20
             K_time = 20
             K_emis = 20
@@ -438,14 +434,12 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
             batch_finish_time = max(batch_finish_time, arrival_time)
 
-            # LT is HARD: mark infeasible if violated
             if arrival_time > batch.LT:
                 penalty += (arrival_time - batch.LT) * 1000.0
                 late_violation = True
 
         makespan = max(makespan, batch_finish_time)
 
-    # Capacity constraint (arc, time bucket)
     for (key, slot), flow in arc_flow_map.items():
         cap = arc_caps.get(key, 1e9)
         if flow > cap:
@@ -464,186 +458,8 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
 
 # ========================
-# 5. Genetic operators
+# 5. Genetic operators (Mutation from your code + Crossover from source A)
 # ========================
-
-def are_individuals_identical(genes1, genes2) -> bool:
-    if len(genes1) != len(genes2):
-        return False
-    return all(g1 == g2 for g1, g2 in zip(genes1, genes2))
-
-
-def find_allocation_index(allocations: List['PathAllocation'],
-                          target: 'PathAllocation') -> int:
-    for i, alloc in enumerate(allocations):
-        if alloc == target:
-            return i
-    return None
-
-
-def find_common_intermediate_nodes(path1_nodes, path2_nodes):
-    if not path1_nodes or not path2_nodes:
-        return []
-    intermediate1 = set(path1_nodes[1:-1])
-    intermediate2 = set(path2_nodes[1:-1])
-    return list(intermediate1.intersection(intermediate2))
-
-
-def perform_single_point_crossover(alloc1, alloc2, common_node):
-    path1 = alloc1.path
-    path2 = alloc2.path
-
-    idx1 = path1.nodes.index(common_node)
-    idx2 = path2.nodes.index(common_node)
-
-    new_nodes1 = path1.nodes[:idx1] + path2.nodes[idx2:]
-    new_nodes2 = path2.nodes[:idx2] + path1.nodes[idx1:]
-
-    new_modes1 = path1.modes[:idx1] + path2.modes[idx2:]
-    new_modes2 = path2.modes[:idx2] + path1.modes[idx1:]
-
-    new_path1 = Path(
-        path_id=-1,
-        origin=path1.origin,
-        destination=path1.destination,
-        nodes=new_nodes1,
-        modes=new_modes1,
-        arcs=[],
-        base_cost_per_teu=0.0,
-        base_emission_per_teu=0.0,
-        base_travel_time_h=0.0
-    )
-
-    new_path2 = Path(
-        path_id=-1,
-        origin=path2.origin,
-        destination=path2.destination,
-        nodes=new_nodes2,
-        modes=new_modes2,
-        arcs=[],
-        base_cost_per_teu=0.0,
-        base_emission_per_teu=0.0,
-        base_travel_time_h=0.0
-    )
-
-    return (PathAllocation(path=new_path1, share=alloc1.share),
-            PathAllocation(path=new_path2, share=alloc2.share))
-
-
-def basic_path_repair(alloc):
-    nodes = alloc.path.nodes
-    modes = alloc.path.modes
-
-    seen = set()
-    unique_nodes = []
-    unique_modes = []
-
-    for i, node in enumerate(nodes):
-        if node not in seen:
-            seen.add(node)
-            unique_nodes.append(node)
-            if i < len(modes):
-                unique_modes.append(modes[i])
-
-    if unique_nodes[0] != alloc.path.origin:
-        unique_nodes.insert(0, alloc.path.origin)
-        if unique_modes:
-            unique_modes.insert(0, unique_modes[0])
-
-    if unique_nodes[-1] != alloc.path.destination:
-        unique_nodes.append(alloc.path.destination)
-        if unique_modes:
-            unique_modes.append(unique_modes[-1])
-
-    repaired_path = Path(
-        path_id=alloc.path.path_id,
-        origin=alloc.path.origin,
-        destination=alloc.path.destination,
-        nodes=unique_nodes,
-        modes=unique_modes,
-        arcs=alloc.path.arcs,
-        base_cost_per_teu=alloc.path.base_cost_per_teu,
-        base_emission_per_teu=alloc.path.base_emission_per_teu,
-        base_travel_time_h=alloc.path.base_travel_time_h
-    )
-
-    return PathAllocation(path=repaired_path, share=alloc.share)
-
-
-def crossover(ind1: 'Individual', ind2: 'Individual',
-              batches: List['Batch']) -> Tuple['Individual', 'Individual']:
-
-    child1 = deepcopy(ind1)
-    child2 = deepcopy(ind2)
-
-    batch_keys = [(batch.origin, batch.destination, batch.batch_id)
-                  for batch in batches]
-    random.shuffle(batch_keys)
-
-    crossed = False
-
-    for key in batch_keys:
-        allocs1 = ind1.od_allocations.get(key, [])
-        allocs2 = ind2.od_allocations.get(key, [])
-
-        if not allocs1 or not allocs2:
-            continue
-
-        if are_individuals_identical(allocs1, allocs2):
-            continue
-
-        common_node_candidates = []
-
-        for alloc1 in allocs1:
-            for alloc2 in allocs2:
-                common_nodes = find_common_intermediate_nodes(
-                    alloc1.path.nodes,
-                    alloc2.path.nodes
-                )
-                if common_nodes:
-                    for node in common_nodes:
-                        common_node_candidates.append({
-                            'alloc1': alloc1,
-                            'alloc2': alloc2,
-                            'common_node': node
-                        })
-
-        if common_node_candidates:
-            candidate = random.choice(common_node_candidates)
-
-            new_alloc1, new_alloc2 = perform_single_point_crossover(
-                candidate['alloc1'],
-                candidate['alloc2'],
-                candidate['common_node']
-            )
-
-            idx1 = find_allocation_index(allocs1, candidate['alloc1'])
-            idx2 = find_allocation_index(allocs2, candidate['alloc2'])
-
-            if idx1 is not None and idx2 is not None:
-                new_allocs1 = deepcopy(allocs1)
-                new_allocs2 = deepcopy(allocs2)
-
-                new_allocs1[idx1] = basic_path_repair(new_alloc1)
-                new_allocs2[idx2] = basic_path_repair(new_alloc2)
-
-                child1.od_allocations[key] = new_allocs1
-                child2.od_allocations[key] = new_allocs2
-
-                crossed = True
-                break
-
-    if not crossed:
-        if batch_keys:
-            random_key = random.choice(batch_keys)
-            if (random_key in child1.od_allocations and
-                    random_key in child2.od_allocations):
-                child1.od_allocations[random_key], child2.od_allocations[random_key] = \
-                    child2.od_allocations[random_key], child1.od_allocations[random_key]
-
-    return child1, child2
-
-
 
 def mutate_structural(ind: Individual, batches: List[Batch],
                       path_lib: Dict[Tuple[str, str], List[Path]],
@@ -726,9 +542,8 @@ def mutate_mode_two_arcs(ind: Individual,
             continue
         new_arc = random.choice(alt)
         new_path.arcs[pos] = new_arc
-        new_path.modes[pos] = new_arc.mode  # keep modes aligned with arcs
+        new_path.modes[pos] = new_arc.mode
 
-    # Recompute base attributes
     new_path.base_cost_per_teu = sum(a.cost_per_teu_km * a.distance for a in new_path.arcs)
     new_path.base_emission_per_teu = sum(a.emission_per_teu_km * a.distance for a in new_path.arcs)
     new_path.base_travel_time_h = sum(a.distance / max(a.speed_kmh, 1.0) for a in new_path.arcs)
@@ -737,26 +552,218 @@ def mutate_mode_two_arcs(ind: Individual,
     ind.od_allocations[key] = merge_and_normalize(allocs)
 
 
+# ---------- Source A crossover helpers ----------
+
+def are_individuals_identical(genes1, genes2) -> bool:
+    """Use PathAllocation.__eq__ for strict content equality (order-sensitive)."""
+    if len(genes1) != len(genes2):
+        return False
+    return all(g1 == g2 for g1, g2 in zip(genes1, genes2))
+
+
+def find_common_intermediate_nodes(path1_nodes, path2_nodes):
+    """Find common non-terminal nodes between two paths."""
+    if not path1_nodes or not path2_nodes:
+        return []
+    intermediate1 = set(path1_nodes[1:-1])
+    intermediate2 = set(path2_nodes[1:-1])
+    return list(intermediate1.intersection(intermediate2))
+
+
+def perform_single_point_crossover(alloc1, alloc2, common_node):
+    """
+    Single-point crossover at the common node.
+    NOTE: As in the source, arcs/base attributes are set empty/zero for the new paths.
+    """
+    path1 = alloc1.path
+    path2 = alloc2.path
+
+    idx1 = path1.nodes.index(common_node)
+    idx2 = path2.nodes.index(common_node)
+
+    new_nodes1 = path1.nodes[:idx1] + path2.nodes[idx2:]
+    new_nodes2 = path2.nodes[:idx2] + path1.nodes[idx1:]
+
+    new_modes1 = path1.modes[:idx1] + path2.modes[idx2:]
+    new_modes2 = path2.modes[:idx2] + path1.modes[idx1:]
+
+    new_path1 = Path(
+        path_id=-1,
+        origin=path1.origin,
+        destination=path1.destination,
+        nodes=new_nodes1,
+        modes=new_modes1,
+        arcs=[],
+        base_cost_per_teu=0.0,
+        base_emission_per_teu=0.0,
+        base_travel_time_h=0.0
+    )
+
+    new_path2 = Path(
+        path_id=-1,
+        origin=path2.origin,
+        destination=path2.destination,
+        nodes=new_nodes2,
+        modes=new_modes2,
+        arcs=[],
+        base_cost_per_teu=0.0,
+        base_emission_per_teu=0.0,
+        base_travel_time_h=0.0
+    )
+
+    return (PathAllocation(path=new_path1, share=alloc1.share),
+            PathAllocation(path=new_path2, share=alloc2.share))
+
+
+def find_allocation_index(allocations: List[PathAllocation],
+                          target: PathAllocation) -> int:
+    """Find index by content equality (PathAllocation.__eq__)."""
+    for i, alloc in enumerate(allocations):
+        if alloc == target:
+            return i
+    return None
+
+
+def basic_path_repair(alloc: PathAllocation) -> PathAllocation:
+    """Basic repair: remove repeated nodes and ensure endpoints match origin/destination."""
+    nodes = alloc.path.nodes
+    modes = alloc.path.modes
+
+    seen = set()
+    unique_nodes = []
+    unique_modes = []
+
+    for i, node in enumerate(nodes):
+        if node not in seen:
+            seen.add(node)
+            unique_nodes.append(node)
+            if i < len(modes):
+                unique_modes.append(modes[i])
+
+    if unique_nodes and unique_nodes[0] != alloc.path.origin:
+        unique_nodes.insert(0, alloc.path.origin)
+        if unique_modes:
+            unique_modes.insert(0, unique_modes[0])
+
+    if unique_nodes and unique_nodes[-1] != alloc.path.destination:
+        unique_nodes.append(alloc.path.destination)
+        if unique_modes:
+            unique_modes.append(unique_modes[-1])
+
+    repaired_path = Path(
+        path_id=alloc.path.path_id,
+        origin=alloc.path.origin,
+        destination=alloc.path.destination,
+        nodes=unique_nodes,
+        modes=unique_modes,
+        arcs=alloc.path.arcs,
+        base_cost_per_teu=alloc.path.base_cost_per_teu,
+        base_emission_per_teu=alloc.path.base_emission_per_teu,
+        base_travel_time_h=alloc.path.base_travel_time_h
+    )
+
+    return PathAllocation(path=repaired_path, share=alloc.share)
+
+
+def crossover(ind1: Individual, ind2: Individual,
+              batches: List[Batch]) -> Tuple[Individual, Individual]:
+    """
+    Source A crossover (integrated):
+    1) Randomly shuffle batch keys and try to find the first batch where:
+       - both parents have allocations
+       - allocations are not identical
+       - exist a pair of paths with a common intermediate node
+       then do single-point crossover at that node and replace one allocation in each parent.
+    2) If no such batch found, fallback: swap the whole allocation list for one random batch.
+    3) Other batches are inherited via deepcopy from parents.
+    """
+    child1 = deepcopy(ind1)
+    child2 = deepcopy(ind2)
+
+    batch_keys = [(b.origin, b.destination, b.batch_id) for b in batches]
+    random.shuffle(batch_keys)
+
+    crossed = False
+
+    for key in batch_keys:
+        allocs1 = ind1.od_allocations.get(key, [])
+        allocs2 = ind2.od_allocations.get(key, [])
+
+        if not allocs1 or not allocs2:
+            continue
+
+        if are_individuals_identical(allocs1, allocs2):
+            continue
+
+        common_node_candidates = []
+
+        for alloc1 in allocs1:
+            for alloc2 in allocs2:
+                common_nodes = find_common_intermediate_nodes(
+                    alloc1.path.nodes,
+                    alloc2.path.nodes
+                )
+                if common_nodes:
+                    for node in common_nodes:
+                        common_node_candidates.append({
+                            "alloc1": alloc1,
+                            "alloc2": alloc2,
+                            "common_node": node
+                        })
+
+        if common_node_candidates:
+            candidate = random.choice(common_node_candidates)
+
+            new_alloc1, new_alloc2 = perform_single_point_crossover(
+                candidate["alloc1"],
+                candidate["alloc2"],
+                candidate["common_node"]
+            )
+
+            idx1 = find_allocation_index(allocs1, candidate["alloc1"])
+            idx2 = find_allocation_index(allocs2, candidate["alloc2"])
+
+            if idx1 is not None and idx2 is not None:
+                new_allocs1 = deepcopy(allocs1)
+                new_allocs2 = deepcopy(allocs2)
+
+                new_allocs1[idx1] = basic_path_repair(new_alloc1)
+                new_allocs2[idx2] = basic_path_repair(new_alloc2)
+
+                child1.od_allocations[key] = new_allocs1
+                child2.od_allocations[key] = new_allocs2
+
+                crossed = True
+                break
+
+    if not crossed:
+        if batch_keys:
+            random_key = random.choice(batch_keys)
+            if (random_key in child1.od_allocations and
+                    random_key in child2.od_allocations):
+                child1.od_allocations[random_key], child2.od_allocations[random_key] = \
+                    child2.od_allocations[random_key], child1.od_allocations[random_key]
+
+    return child1, child2
+
+
 # ========================
 # 6. Hypervolume + dedup by objectives
 # ========================
 
 class HypervolumeCalculator:
     """
-    FIX: compute hypervolume in NORMALISED space [0,1]^3.
-    We keep the real ref_point for normalisation, but sample in the unit cube.
+    Compute hypervolume in NORMALISED space [0,1]^3.
     """
     def __init__(self, ref_point: Tuple[float, float, float], num_samples=10000):
         self.ref_point = np.array(ref_point, dtype=float)  # real scales
         self.num_samples = num_samples
 
-        self.ideal_point = np.zeros(3, dtype=float)
         self.samples = np.random.uniform(
-            low=self.ideal_point,
+            low=np.zeros(3, dtype=float),
             high=np.ones(3, dtype=float),
             size=(self.num_samples, 3)
         )
-        self.total_volume = 1.0
 
     def calculate(self, pareto_front_inds: List[Individual]) -> float:
         if not pareto_front_inds:
@@ -773,8 +780,8 @@ class HypervolumeCalculator:
         if len(valid_objs) == 0:
             return 0.0
 
-        S = self.samples[:, np.newaxis, :]  # (Samples,1,3)
-        O = valid_objs[np.newaxis, :, :]    # (1,FrontSize,3)
+        S = self.samples[:, np.newaxis, :]
+        O = valid_objs[np.newaxis, :, :]
 
         is_dominated = np.all(O <= S, axis=2)
         dominated_samples = np.any(is_dominated, axis=1)
@@ -790,7 +797,9 @@ def unique_individuals_by_objectives(front: List[Individual], tol: float = 1e-3)
         obj = ind.objectives
         dup = False
         for o in seen:
-            if (abs(obj[0] - o[0]) <= tol and abs(obj[1] - o[1]) <= tol and abs(obj[2] - o[2]) <= tol):
+            if (abs(obj[0] - o[0]) <= tol and
+                abs(obj[1] - o[1]) <= tol and
+                abs(obj[2] - o[2]) <= tol):
                 dup = True
                 break
         if not dup:
@@ -822,13 +831,12 @@ def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
 
 
 def dominates(a: Individual, b: Individual) -> bool:
-    # constraint-domination
     if a.feasible and not b.feasible:
         return True
     if b.feasible and not a.feasible:
         return False
-
-    return all(x <= y for x, y in zip(a.objectives, b.objectives)) and any(x < y for x, y in zip(a.objectives, b.objectives))
+    return all(x <= y for x, y in zip(a.objectives, b.objectives)) and \
+           any(x < y for x, y in zip(a.objectives, b.objectives))
 
 
 def non_dominated_sort(pop: List[Individual]) -> List[List[Individual]]:
@@ -903,17 +911,14 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
     print("Building path library...")
     path_lib = build_path_library(node_names, arcs, batches, timetables)
 
-    # Build parallel arc index for mode mutation
     parallel_idx = build_parallel_arc_index(arcs)
 
-    # Initial population
     population: List[Individual] = []
     for _ in range(pop_size):
         ind = random_initial_individual(batches, path_lib)
         evaluate_individual(ind, batches, path_lib, arcs, tt_dict)
         population.append(ind)
 
-    # HV ref_point based on initial pop maxima (kept as real scales; HV computed in normalized cube)
     all_objs = np.array([ind.objectives for ind in population], dtype=float)
     max_vals = np.max(all_objs, axis=0)
     ref_point = max_vals * 1.2
@@ -938,12 +943,9 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
         hv_history.append(current_hv)
 
         best_f1 = min(obj[0] for obj in current_front_objs) if current_front_objs else float("inf")
-
-        # DEBUG: show how many feasible solutions are in F0
         print(f"Gen {gen}: Best Cost={best_f1:.0f}, "
               f"Front Size={len(front0_unique)}, FeasibleInF0={len(feasible_front0)}, HV={current_hv:.4f}")
 
-        # ranks + crowding
         ranks: Dict[Individual, int] = {}
         for r, f in enumerate(fronts):
             for ind in f:
@@ -953,16 +955,15 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
         for f in fronts:
             dists.update(crowding_distance(f))
 
-        # selection
         mating_pool: List[Individual] = []
         while len(mating_pool) < pop_size:
             mating_pool.append(tournament_select(population, dists, ranks))
 
-        # offspring
         offspring: List[Individual] = []
         while len(offspring) < pop_size:
             if random.random() < 0.7:
                 p1, p2 = random.sample(mating_pool, 2)
+                # ===== CHANGED: use Source A crossover =====
                 c1, c2 = crossover(p1, p2, batches)
             else:
                 c1 = random_initial_individual(batches, path_lib)
