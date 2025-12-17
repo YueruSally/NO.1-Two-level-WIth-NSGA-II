@@ -461,10 +461,32 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 # 5. Genetic operators (Mutation from your code + Crossover from source A)
 # ========================
 
-def mutate_structural(ind: Individual, batches: List[Batch],
+def roulette_pick(items, weights):
+    """Return one item by roulette-wheel selection."""
+    s = sum(max(w, 0.0) for w in weights)
+    if s <= 1e-12:
+        return random.choice(items)
+    r = random.random() * s
+    acc = 0.0
+    for it, w in zip(items, weights):
+        acc += max(w, 0.0)
+        if r <= acc:
+            return it
+    return items[-1]
+
+
+def mutate_structural(ind: Individual,
+                      batches: List[Batch],
                       path_lib: Dict[Tuple[str, str], List[Path]],
-                      p_add=0.2, p_del=0.3, p_mod=0.5):
-    """Add/delete a path or perturb shares, then normalize (per randomly chosen batch)."""
+                      w_add=0.2, w_del=0.3, w_mod=0.5,
+                      new_path_init_share=0.2):
+    """
+    Structural mutation via roulette wheel:
+    choose ONE of {add, del, mod-share} for ONE randomly chosen batch,
+    then merge_and_normalize.
+
+    w_add/w_del/w_mod are roulette weights (not independent probabilities).
+    """
     if not batches:
         return
 
@@ -474,26 +496,49 @@ def mutate_structural(ind: Individual, batches: List[Batch],
 
     allocs = ind.od_allocations.get(key, [])
     paths_in_lib = path_lib.get(od, [])
-
     if not paths_in_lib:
         return
 
-    if random.random() < p_add:
-        current_structures = {a.path for a in allocs}
-        candidates = [p for p in paths_in_lib if p not in current_structures]
-        if candidates:
-            new_path = random.choice(candidates)
-            allocs.append(PathAllocation(path=new_path, share=0.2))
+    # ---- feasibility-aware operator set ----
+    ops = []
+    ws = []
 
-    if random.random() < p_del:
-        if len(allocs) > 1:
-            allocs.pop(random.randint(0, len(allocs) - 1))
+    # add feasible?
+    current_structures = {a.path for a in allocs}
+    add_candidates = [p for p in paths_in_lib if p not in current_structures]
+    if len(add_candidates) > 0:
+        ops.append("add")
+        ws.append(w_add)
 
-    if random.random() < p_mod and allocs:
+    # delete feasible? (keep at least 1 path)
+    if len(allocs) > 1:
+        ops.append("del")
+        ws.append(w_del)
+
+    # modify-share feasible?
+    if len(allocs) > 0:
+        ops.append("mod")
+        ws.append(w_mod)
+
+    if not ops:
+        return
+
+    op = roulette_pick(ops, ws)
+
+    if op == "add":
+        new_path = random.choice(add_candidates)
+        allocs.append(PathAllocation(path=new_path, share=new_path_init_share))
+
+    elif op == "del":
+        # remove one allocation randomly
+        allocs.pop(random.randint(0, len(allocs) - 1))
+
+    elif op == "mod":
         target = random.choice(allocs)
         target.share *= random.uniform(0.5, 1.5)
 
     ind.od_allocations[key] = merge_and_normalize(allocs)
+
 
 
 def mutate_mode_two_arcs(ind: Individual,
@@ -969,15 +1014,25 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
                 c1 = random_initial_individual(batches, path_lib)
                 c2 = random_initial_individual(batches, path_lib)
 
-            if random.random() < 0.3:
-                mutate_structural(c1, batches, path_lib)
-            if random.random() < 0.2:
-                mutate_mode_two_arcs(c1, batches, parallel_idx)
+            P_MUT = 0.3  # 总变异概率（你原来结构变异的 0.3 可以继续沿用）
 
-            if random.random() < 0.3:
-                mutate_structural(c2, batches, path_lib)
-            if random.random() < 0.2:
-                mutate_mode_two_arcs(c2, batches, parallel_idx)
+    # ---- child1 ----
+            if random.random() < P_MUT:
+                mutate_structural(
+                c1, batches, path_lib,
+                w_add=0.2, w_del=0.3, w_mod=0.5
+                )
+    # 必须项：无条件尝试做模式变异（函数内部若无可换位置会直接return）
+                mutate_mode_two_arcs(c1, batches, parallel_idx, p=1.0)
+
+# ---- child2 ----
+            if random.random() < P_MUT:
+                mutate_structural(
+                c2, batches, path_lib,
+                w_add=0.2, w_del=0.3, w_mod=0.5
+                )
+                mutate_mode_two_arcs(c2, batches, parallel_idx, p=1.0)
+
 
             evaluate_individual(c1, batches, path_lib, arcs, tt_dict)
             evaluate_individual(c2, batches, path_lib, arcs, tt_dict)
