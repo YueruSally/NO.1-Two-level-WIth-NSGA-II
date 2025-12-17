@@ -987,6 +987,34 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=50, generations=100):
         current_hv = hv_calc.calculate(front0_unique)
         hv_history.append(current_hv)
 
+        # ===== DEBUG: why HV==0 in early generations? =====
+if current_hv == 0.0:
+    print(f"[DEBUG Gen {gen}] HV=0.0")
+    print(f"  Front0 size={len(front0)}, FeasibleInF0={len(feasible_front0)}")
+    print(f"  Using base_front={'feasible_front0' if feasible_front0 else 'front0'}; unique={len(front0_unique)}")
+
+    if front0_unique:
+        objs = np.array([ind.objectives for ind in front0_unique], dtype=float)
+        print("  Obj min/mean/max in base_front:")
+        print("    min :", np.min(objs, axis=0))
+        print("    mean:", np.mean(objs, axis=0))
+        print("    max :", np.max(objs, axis=0))
+        print("  ref_point:", hv_calc.ref_point)
+
+        denom = np.where(hv_calc.ref_point <= 0, 1.0, hv_calc.ref_point)
+        norm = objs / denom
+
+        # 统计有多少点会被 clip 到 >=1（导致无法支配任何随机样本点）
+        clipped_high = np.sum(np.any(norm >= 1.0, axis=1))
+        all_high = np.sum(np.all(norm >= 1.0, axis=1))
+        print(f"  #solutions with any(norm>=1): {clipped_high}/{len(norm)}")
+        print(f"  #solutions with all(norm>=1): {all_high}/{len(norm)}")
+
+        # 看看是不是罚项巨大导致 objective 爆炸
+        penalties = np.array([ind.penalty for ind in front0_unique], dtype=float)
+        print("  penalty min/mean/max:", penalties.min(), penalties.mean(), penalties.max())
+
+
         best_f1 = min(obj[0] for obj in current_front_objs) if current_front_objs else float("inf")
         print(f"Gen {gen}: Best Cost={best_f1:.0f}, "
               f"Front Size={len(front0_unique)}, FeasibleInF0={len(feasible_front0)}, HV={current_hv:.4f}")
