@@ -6,7 +6,7 @@ import random
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,15 +16,15 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
 # ========================
-# 全局设置
+# Global settings
 # ========================
 
-TIME_BUCKET_H = 1.0  # 仿真时间粒度：1小时
+TIME_BUCKET_H = 1.0  # simulation granularity: 1 hour
 CHINA_REGIONS = {"CN", "China"}
 EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
-BIG_M = 1e6  # 容量惩罚的大常数
+BIG_M = 1e6  # big penalty for capacity violation
 
-# ---- Mutation roulette weights (you can tune)
+# ---- Mutation roulette weights (tuneable)
 W_ADD = 0.25
 W_DEL = 0.20
 W_MOD = 0.35
@@ -32,7 +32,7 @@ W_MODE = 0.20
 
 
 # ========================
-# 1. 数据结构定义
+# 1. Data structures
 # ========================
 
 @dataclass
@@ -41,7 +41,7 @@ class Arc:
     to_node: str
     mode: str
     distance: float
-    capacity: float       # 单位：TEU / TimeBucket (例如 TEU/小时)
+    capacity: float       # TEU / time-bucket
     cost_per_teu_km: float
     emission_per_teu_km: float
     speed_kmh: float
@@ -79,7 +79,6 @@ class Path:
     base_emission_per_teu: float
     base_travel_time_h: float
 
-    # 忽略 ID，只比较结构
     def __eq__(self, other):
         if not isinstance(other, Path):
             return NotImplemented
@@ -94,17 +93,13 @@ class PathAllocation:
     path: Path
     share: float
 
-    # 关键：自定义 __eq__，基于内容比较，而非实例
     def __eq__(self, other):
         if not isinstance(other, PathAllocation):
             return NotImplemented
-        # 比较 Path 对象（使用 Path 的 __eq__）和 share（考虑浮点误差）
-        return (self.path == other.path and
-                abs(self.share - other.share) < 1e-10)
+        return (self.path == other.path and abs(self.share - other.share) < 1e-10)
 
-    # 关键：自定义 __hash__，使对象可哈希，用于集合和字典键
     def __hash__(self):
-        share_for_hash = round(self.share, 10)  # 限制精度以保持一致性
+        share_for_hash = round(self.share, 10)
         return hash((self.path, share_for_hash))
 
     def __repr__(self):
@@ -118,17 +113,15 @@ class PathAllocation:
 
 @dataclass(eq=False)
 class Individual:
-    # (origin, dest, batch_id)
+    # key = (origin, destination, batch_id)
     od_allocations: Dict[Tuple[str, str, int], List[PathAllocation]] = field(default_factory=dict)
-    # Objectives: Cost, Emission, Time
-    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
-    # 约束相关
+    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))  # (cost, emission, makespan)
     penalty: float = 0.0
     feasible: bool = False
 
 
 # ========================
-# 2. 核心逻辑：去重与归一化
+# 2. Core utilities: merge & normalise shares
 # ========================
 
 def clone_gene(alloc: PathAllocation) -> PathAllocation:
@@ -139,19 +132,13 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
     if not allocs:
         return []
 
-    # 合并相同结构的路径
     merged_map: Dict[Path, float] = {}
     for a in allocs:
-        if a.path not in merged_map:
-            merged_map[a.path] = a.share
-        else:
-            merged_map[a.path] += a.share
+        merged_map[a.path] = merged_map.get(a.path, 0.0) + a.share
 
     unique_allocs = [PathAllocation(path=p, share=s) for p, s in merged_map.items()]
 
-    # 归一化
     total_share = sum(a.share for a in unique_allocs)
-
     if total_share <= 1e-9:
         if not unique_allocs:
             return []
@@ -163,13 +150,13 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
         for a in unique_allocs:
             a.share *= factor
 
-    # 过滤微小份额
+    # remove tiny shares
     unique_allocs = [a for a in unique_allocs if a.share > 0.001]
 
-    # 二次修正，保证总和 ≈ 1
+    # re-normalise
     if unique_allocs:
         final_total = sum(a.share for a in unique_allocs)
-        if abs(final_total - 1.0) > 1e-6:
+        if abs(final_total - 1.0) > 1e-6 and final_total > 1e-12:
             for a in unique_allocs:
                 a.share /= final_total
 
@@ -177,15 +164,14 @@ def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
 
 
 # ========================
-# 3. 数据读取与图构建
+# 3. Load data + build graph/library
 # ========================
 
 def load_network_from_extended(filename: str):
     try:
         xls = pd.ExcelFile(filename)
     except FileNotFoundError:
-        print(f"Error: File '{filename}' not found.")
-        exit(1)
+        raise FileNotFoundError(f"File '{filename}' not found.")
 
     # Nodes
     nodes_df = pd.read_excel(xls, "Nodes")
@@ -197,7 +183,6 @@ def load_network_from_extended(filename: str):
     arcs_df = pd.read_excel(xls, "Arcs_All")
     arcs: List[Arc] = []
 
-    # 假设 Excel 中的 Capacity 是 TEU/Day，需要转换成 TEU/TimeBucket
     DAILY_HOURS = 24.0
 
     for _, row in arcs_df.iterrows():
@@ -209,7 +194,7 @@ def load_network_from_extended(filename: str):
         cleaned = "".join(ch for ch in dist_str if (ch.isdigit() or ch == "."))
         distance = float(cleaned) if cleaned else 0.0
 
-        # 容量：从 TEU/Day 转换为 TEU/TimeBucket
+        # capacity: TEU/day -> TEU/time-bucket
         if "Capacity_TEU" in arcs_df.columns and not pd.isna(row["Capacity_TEU"]):
             raw_cap = float(row["Capacity_TEU"])
         else:
@@ -283,7 +268,6 @@ def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
 
 
 def build_timetable_dict(timetables: List[TimetableEntry]) -> Dict[Tuple[str, str, str], List[TimetableEntry]]:
-    """将时刻表预处理为字典，加速查询。"""
     tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]] = {}
     for t in timetables:
         key = (t.from_node, t.to_node, t.mode)
@@ -345,27 +329,25 @@ def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str,
 
         if paths_for_od:
             paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
-            path_lib[od] = paths_for_od[:20]  # 保留前20条路径
+            path_lib[od] = paths_for_od[:20]
 
     return path_lib
 
 
 # ========================
-# 4. 评估逻辑（目标 + 可行性检查）
+# 4. Evaluation (objectives + feasibility)
 # ========================
 
 def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
                                 arc_flow_map) -> float:
     """
-    按批次ET出发，沿path仿真时间与容量占用。
-    - Road: 随到随走 (不看时刻表)
-    - Rail / Water: 按 Timetable 等下一班
+    - Road: depart immediately (ignore timetable)
+    - Rail/Water: wait for next departure (simplified to first timetable entry)
     """
     t = batch.ET
     for arc in path.arcs:
         travel_time = arc.distance / max(arc.speed_kmh, 1.0)
 
-        # 公路：强制不看时刻表，随到随走
         if arc.mode == "road":
             entries = []
         else:
@@ -375,7 +357,6 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
         if not entries:
             dep = t
         else:
-            # 简化：只用第一条时刻信息
             e = entries[0]
             if t <= e.first_departure_hour:
                 dep = e.first_departure_hour
@@ -386,7 +367,6 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
 
         arr = dep + travel_time
 
-        # 记录容量占用（以出发时间所在的 Time Bucket 为粒度）
         start_slot = int(dep)
         key = (arc.from_node, arc.to_node, arc.mode)
         slot_key = (key, start_slot)
@@ -394,7 +374,6 @@ def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
 
         t = arr
 
-    # 返回总旅行时间（相对于ET）
     return t - batch.ET
 
 
@@ -408,18 +387,15 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
     penalty = 0.0
 
-    # 约束违背标记
     missing_alloc_violation = False
     late_violation = False
     capacity_violation = False
 
     for batch in batches:
-        # 按 (O,D,batch_id) 取编码
         key = (batch.origin, batch.destination, batch.batch_id)
         allocs = ind.od_allocations.get(key, [])
 
         if not allocs:
-            # 没有为该批次分配路径 → 严重不可行
             penalty += 1e9
             missing_alloc_violation = True
             continue
@@ -441,14 +417,12 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
 
             batch_finish_time = max(batch_finish_time, arrival_time)
 
-            # 软时间窗惩罚：这里也当成“可行性条件”
             if arrival_time > batch.LT:
                 penalty += (arrival_time - batch.LT) * 1000.0
                 late_violation = True
 
         makespan = max(makespan, batch_finish_time)
 
-    # 容量约束惩罚：按（弧, 时间桶）检查
     for (key, slot), flow in arc_flow_map.items():
         cap = arc_caps.get(key, 1e9)
         if flow > cap:
@@ -459,18 +433,17 @@ def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
                       total_emission + penalty,
                       makespan)
     ind.penalty = penalty
-    # 所有约束都满足才算可行
     ind.feasible = not (missing_alloc_violation or late_violation or capacity_violation)
 
 
 # ========================
-# 5. 遗传算子
+# 5. Genetic operators
 # ========================
 
 def crossover_structural(ind1: Individual, ind2: Individual,
                          batches: List[Batch]) -> Tuple[Individual, Individual]:
-    """结构+份额的片段交叉，交叉后用 merge_and_normalize 修复 share。
-       现在以 (origin,destination,batch_id) 为 key，对每个批次单独交叉。
+    """
+    Fragment crossover per batch key; share fixed by merge_and_normalize.
     """
     child1 = Individual()
     child2 = Individual()
@@ -505,224 +478,13 @@ def crossover_structural(ind1: Individual, ind2: Individual,
     return child1, child2
 
 
-def crossover(ind1: 'Individual', ind2: 'Individual',
-              batches: List['Batch']) -> Tuple['Individual', 'Individual']:
-    """
-    针对单个批次进行交叉，其他批次直接继承。
-    策略：
-    1. 随机打乱所有批次，遍历寻找可交叉的批次
-    2. 找到第一个有共同节点的批次，进行单点交叉
-    3. 如果找不到，随机选择一个批次进行路径交换
-    4. 其余批次直接复制父代
-    """
-    # 创建子代，初始复制父代所有分配
-    child1 = deepcopy(ind1)
-    child2 = deepcopy(ind2)
-
-    # 获取所有批次键并随机打乱
-    batch_keys = [(batch.origin, batch.destination, batch.batch_id)
-                  for batch in batches]
-    random.shuffle(batch_keys)
-
-    crossed = False  # 标记是否已执行交叉
-
-    for key in batch_keys:
-        # 获取该批次的路径分配
-        allocs1 = ind1.od_allocations.get(key, [])
-        allocs2 = ind2.od_allocations.get(key, [])
-
-        # 检查是否有路径可交叉
-        if not allocs1 or not allocs2:
-            continue  # 至少一个个体没有该批次的分配
-
-        # 检查是否基因完全相同（如果是则跳过）
-        if are_individuals_identical(allocs1, allocs2):
-            continue  # 基因相同，无法产生新基因
-
-        # 寻找有共同中间节点的路径对
-        common_node_candidates = []
-
-        # 遍历所有路径组合
-        for alloc1 in allocs1:
-            for alloc2 in allocs2:
-                common_nodes = find_common_intermediate_nodes(
-                    alloc1.path.nodes,
-                    alloc2.path.nodes
-                )
-
-                if common_nodes:
-                    for node in common_nodes:
-                        common_node_candidates.append({
-                            'alloc1': alloc1,
-                            'alloc2': alloc2,
-                            'common_node': node
-                        })
-
-        # 如果找到共同节点，执行交叉
-        if common_node_candidates:
-            candidate = random.choice(common_node_candidates)
-
-            new_alloc1, new_alloc2 = perform_single_point_crossover(
-                candidate['alloc1'],
-                candidate['alloc2'],
-                candidate['common_node']
-            )
-
-            idx1 = find_allocation_index(allocs1, candidate['alloc1'])
-            idx2 = find_allocation_index(allocs2, candidate['alloc2'])
-
-            if idx1 is not None and idx2 is not None:
-                new_allocs1 = deepcopy(allocs1)
-                new_allocs2 = deepcopy(allocs2)
-
-                new_allocs1[idx1] = new_alloc1
-                new_allocs2[idx2] = new_alloc2
-
-                new_allocs1[idx1] = basic_path_repair(new_allocs1[idx1])
-                new_allocs2[idx2] = basic_path_repair(new_allocs2[idx2])
-
-                child1.od_allocations[key] = new_allocs1
-                child2.od_allocations[key] = new_allocs2
-
-                print(f"✅ 批次 {key} 基于节点 '{candidate['common_node']}' 交叉")
-                crossed = True
-                break  # 只交叉一个批次
-
-    if not crossed:
-        if batch_keys:
-            random_key = random.choice(batch_keys)
-            if (random_key in child1.od_allocations and
-                    random_key in child2.od_allocations):
-                child1.od_allocations[random_key], child2.od_allocations[random_key] = \
-                    child2.od_allocations[random_key], child1.od_allocations[random_key]
-                print(f"⚠️  无共同节点，随机交换批次 {random_key}")
-                crossed = True
-
-    return child1, child2
-
-
-def are_individuals_identical(genes1, genes2) -> bool:
-    if len(genes1) != len(genes2):
-        return False
-    return all(g1 == g2 for g1, g2 in zip(genes1, genes2))
-
-
-def find_allocation_index(allocations: List['PathAllocation'],
-                          target: 'PathAllocation') -> int:
-    for i, alloc in enumerate(allocations):
-        if alloc == target:
-            return i
-    return None
-
-
-def find_common_intermediate_nodes(path1_nodes, path2_nodes):
-    """找到两条路径的非端点共同节点"""
-    if not path1_nodes or not path2_nodes:
-        return []
-
-    intermediate1 = set(path1_nodes[1:-1])
-    intermediate2 = set(path2_nodes[1:-1])
-    return list(intermediate1.intersection(intermediate2))
-
-
-def perform_single_point_crossover(alloc1, alloc2, common_node):
-    """在共同节点处执行单点交叉"""
-    path1 = alloc1.path
-    path2 = alloc2.path
-
-    idx1 = path1.nodes.index(common_node)
-    idx2 = path2.nodes.index(common_node)
-
-    new_nodes1 = path1.nodes[:idx1] + path2.nodes[idx2:]
-    new_nodes2 = path2.nodes[:idx2] + path1.nodes[idx1:]
-
-    new_modes1 = path1.modes[:idx1] + path2.modes[idx2:]
-    new_modes2 = path2.modes[:idx2] + path1.modes[idx1:]
-
-    new_path1 = Path(
-        path_id=-1,
-        origin=path1.origin,
-        destination=path1.destination,
-        nodes=new_nodes1,
-        modes=new_modes1,
-        arcs=[],
-        base_cost_per_teu=0.0,
-        base_emission_per_teu=0.0,
-        base_travel_time_h=0.0
-    )
-
-    new_path2 = Path(
-        path_id=-1,
-        origin=path2.origin,
-        destination=path2.destination,
-        nodes=new_nodes2,
-        modes=new_modes2,
-        arcs=[],
-        base_cost_per_teu=0.0,
-        base_emission_per_teu=0.0,
-        base_travel_time_h=0.0
-    )
-
-    return (PathAllocation(path=new_path1, share=alloc1.share),
-            PathAllocation(path=new_path2, share=alloc2.share))
-
-
-def basic_path_repair(alloc):
-    """基础路径修复：去重和确保端点正确"""
-    nodes = alloc.path.nodes
-    modes = alloc.path.modes
-
-    seen = set()
-    unique_nodes = []
-    unique_modes = []
-
-    for i, node in enumerate(nodes):
-        if node not in seen:
-            seen.add(node)
-            unique_nodes.append(node)
-            if i < len(modes):
-                unique_modes.append(modes[i])
-
-    if unique_nodes[0] != alloc.path.origin:
-        unique_nodes.insert(0, alloc.path.origin)
-        if unique_modes:
-            unique_modes.insert(0, unique_modes[0])
-
-    if unique_nodes[-1] != alloc.path.destination:
-        unique_nodes.append(alloc.path.destination)
-        if unique_modes:
-            unique_modes.append(unique_modes[-1])
-
-    repaired_path = Path(
-        path_id=alloc.path.path_id,
-        origin=alloc.path.origin,
-        destination=alloc.path.destination,
-        nodes=unique_nodes,
-        modes=unique_modes,
-        arcs=alloc.path.arcs,
-        base_cost_per_teu=alloc.path.base_cost_per_teu,
-        base_emission_per_teu=alloc.path.base_emission_per_teu,
-        base_travel_time_h=alloc.path.base_travel_time_h
-    )
-
-    return PathAllocation(path=repaired_path, share=alloc.share)
-
-
-# ========================
-# 5.1 变异（四算子轮盘赌）——仅改这一块
-# ========================
-
-# lazy caches built from path_lib (避免改动其它模块接口)
+# ---- Mutation caches
 _ARC_LOOKUP: Dict[Tuple[str, str, str], Arc] = {}
 _ARC_MODE_OPTIONS: Dict[Tuple[str, str], List[str]] = {}
 _CACHE_BUILT = False
 
 
 def _build_arc_caches_from_path_lib(path_lib: Dict[Tuple[str, str], List[Path]]):
-    """从 path_lib 扫描可用弧，构建：
-    - (u,v,mode)->Arc lookup
-    - (u,v)->list of available modes
-    """
     global _ARC_LOOKUP, _ARC_MODE_OPTIONS, _CACHE_BUILT
     if _CACHE_BUILT:
         return
@@ -785,17 +547,14 @@ def _mut_modify_share(allocs: List[PathAllocation]):
 
 
 def _mut_mode_single_arc(allocs: List[PathAllocation]):
-    """只改一个路径中的一个弧的 mode，并替换 arc 对象、重算 base_*。"""
     if not allocs:
         return allocs
 
-    # pick one allocation
     a = random.choice(allocs)
     p = a.path
-    if not p.arcs or len(p.arcs) == 0:
+    if not p.arcs:
         return allocs
 
-    # pick one arc position
     pos = random.randrange(len(p.arcs))
     old_arc = p.arcs[pos]
     u, v = old_arc.from_node, old_arc.to_node
@@ -814,14 +573,12 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
     if new_arc is None:
         return allocs
 
-    # IMPORTANT: do NOT mutate Path in-place (hash changes) -> create a new Path
     new_arcs = list(p.arcs)
     new_arcs[pos] = new_arc
     new_modes = list(p.modes)
     if pos < len(new_modes):
         new_modes[pos] = new_mode
     else:
-        # safety (should not happen if modes aligns)
         return allocs
 
     new_path = Path(
@@ -836,7 +593,6 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
         base_travel_time_h=sum(x.distance / max(x.speed_kmh, 1.0) for x in new_arcs),
     )
 
-    # replace in allocs (preserve share)
     for i in range(len(allocs)):
         if allocs[i] == a:
             allocs[i] = PathAllocation(path=new_path, share=a.share)
@@ -846,13 +602,9 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
 
 
 def mutate_structural(ind: Individual, batches: List[Batch],
-                      path_lib: Dict[Tuple[str, str], List[Path]],
-                      p_add=0.2, p_del=0.3, p_mod=0.5):
+                      path_lib: Dict[Tuple[str, str], List[Path]]):
     """
-    ✅ 你原来的 mutate_structural 被替换为“四算子轮盘赌”版本：
-    - add / del / mod-share / mode-change(单段)
-    仍然：随机选一个批次，对该批次编码做变异，最后 merge_and_normalize 修复 share。
-    注意：删除路径在 allocs 仅有1条时禁用（你要求的）。
+    Roulette among: add / del / modify-share / change-mode(one arc)
     """
     _build_arc_caches_from_path_lib(path_lib)
 
@@ -867,7 +619,6 @@ def mutate_structural(ind: Individual, batches: List[Batch],
 
     can_del = len(allocs) > 1
 
-    # ---- roulette weights (del disabled if not applicable)
     op = _roulette_choice([
         ("add", W_ADD),
         ("del", W_DEL if can_del else 0.0),
@@ -888,25 +639,25 @@ def mutate_structural(ind: Individual, batches: List[Batch],
 
 
 # ========================
-# 6. 工具类：Hypervolume 计算 & 解去重
+# 6. Metrics & timing
 # ========================
 
 class HypervolumeCalculator:
-    def __init__(self, ref_point: Tuple[float, float, float], num_samples=10000):
+    """
+    Monte-Carlo HV within [0, ref_point]^m, returns dominated sample ratio (0..1).
+    Use ONLY on normalised objectives (e.g., within [0,1]) for meaningful values.
+    """
+    def __init__(self, ref_point: Tuple[float, float, float], num_samples=20000):
         self.ref_point = np.array(ref_point, dtype=float)
-        self.num_samples = num_samples
+        self.num_samples = int(num_samples)
         self.ideal_point = np.zeros(3, dtype=float)
         self.samples = np.random.uniform(
             low=self.ideal_point,
             high=self.ref_point,
             size=(self.num_samples, 3)
         )
-        self.total_volume = float(np.prod(self.ref_point))
 
-    def calculate(self, pareto_front_inds: List[Individual]) -> float:
-        """
-        返回相对于 ref_point 定义的“归一化超体积”（0–1）。
-        """
+    def calculate(self, pareto_front_inds: List) -> float:
         if not pareto_front_inds:
             return 0.0
 
@@ -924,7 +675,7 @@ class HypervolumeCalculator:
         dominated_samples = np.any(is_dominated, axis=1)
 
         ratio = np.sum(dominated_samples) / float(self.num_samples)
-        return ratio
+        return float(ratio)
 
 
 def unique_individuals_by_objectives(front: List[Individual],
@@ -948,18 +699,13 @@ def unique_individuals_by_objectives(front: List[Individual],
     return unique
 
 
-# ========================
-# 6.1 统计/计时结构（新增）
-# ========================
-
 @dataclass
 class RunStats:
     run_total_time: float = 0.0
     init_time: float = 0.0
-
     ndsort_time: float = 0.0
     crowd_time: float = 0.0
-    hv_time: float = 0.0
+    hv_time: float = 0.0          # optional debug hv timing
     crossover_time: float = 0.0
     mutation_time: float = 0.0
     evaluation_time: float = 0.0
@@ -1001,7 +747,123 @@ class RunStats:
 
 
 # ========================
-# 7. NSGA-II 逻辑 (带可行性 & 记录)
+# 6.2 Reference-front P*, normalisation, IGD+, Spacing, HV_norm
+# ========================
+
+def _dominates_obj(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> bool:
+    return all(x <= y for x, y in zip(a, b)) and any(x < y for x, y in zip(a, b))
+
+
+def pareto_filter_objectives(objs: List[Tuple[float, float, float]], tol: float = 1e-9) -> List[Tuple[float, float, float]]:
+    if not objs:
+        return []
+
+    # de-dup
+    uniq = []
+    for o in objs:
+        ok = True
+        for u in uniq:
+            if (abs(o[0]-u[0]) <= tol and abs(o[1]-u[1]) <= tol and abs(o[2]-u[2]) <= tol):
+                ok = False
+                break
+        if ok:
+            uniq.append(o)
+
+    # non-dominated
+    nd = []
+    for i, a in enumerate(uniq):
+        dominated = False
+        for j, b in enumerate(uniq):
+            if i == j:
+                continue
+            if _dominates_obj(b, a):
+                dominated = True
+                break
+        if not dominated:
+            nd.append(a)
+    return nd
+
+
+def build_reference_front_Pstar(all_feasible_nd_objs: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+    return pareto_filter_objectives(all_feasible_nd_objs, tol=1e-6)
+
+
+def normalise_by_Pstar(A_objs: List[Tuple[float, float, float]],
+                       Pstar: List[Tuple[float, float, float]]):
+    A = np.array(A_objs, dtype=float)
+    P = np.array(Pstar, dtype=float)
+    mins = P.min(axis=0)
+    maxs = P.max(axis=0)
+    ranges = np.where(maxs - mins == 0, 1.0, maxs - mins)
+    A_norm = (A - mins) / ranges
+    return A_norm, mins, maxs
+
+
+def igd_plus(A_norm: np.ndarray, P_norm: np.ndarray) -> float:
+    """
+    IGD+:
+      for each p in P, compute min over a in A of || max(a - p, 0) ||
+      then average over p.
+    """
+    if A_norm.size == 0 or P_norm.size == 0:
+        return float("inf")
+    dists = []
+    for p in P_norm:
+        diff = np.maximum(A_norm - p, 0.0)
+        vals = np.sqrt(np.sum(diff * diff, axis=1))
+        dists.append(np.min(vals))
+    return float(np.mean(dists))
+
+
+def spacing_metric(A_norm: np.ndarray) -> float:
+    if A_norm.shape[0] <= 2:
+        return 0.0
+    D = np.sqrt(((A_norm[:, None, :] - A_norm[None, :, :]) ** 2).sum(axis=2))
+    np.fill_diagonal(D, np.inf)
+    di = D.min(axis=1)
+    dbar = di.mean()
+    return float(np.sqrt(((di - dbar) ** 2).mean()))
+
+
+class _TmpInd:
+    def __init__(self, obj):
+        self.objectives = tuple(obj)
+
+
+def compute_gen_metrics_wrt_Pstar(history_fronts: List[Tuple[int, List[Tuple[float, float, float]]]],
+                                  Pstar: List[Tuple[float, float, float]],
+                                  hv_norm_samples=20000):
+    gens = [g for g, _ in history_fronts]
+    if not Pstar:
+        return gens, [float("inf")]*len(gens), [float("inf")]*len(gens), [0.0]*len(gens)
+
+    P_norm, _, _ = normalise_by_Pstar(Pstar, Pstar)
+    P_norm = np.clip(P_norm, 0.0, 1.0)
+
+    hv_norm_calc = HypervolumeCalculator(ref_point=(1.0, 1.0, 1.0), num_samples=hv_norm_samples)
+
+    igds, sps, hvns = [], [], []
+    for gen, objs in history_fronts:
+        if not objs:
+            igds.append(float("inf"))
+            sps.append(float("inf"))
+            hvns.append(0.0)
+            continue
+
+        A_norm, _, _ = normalise_by_Pstar(objs, Pstar)
+        A_norm = np.clip(A_norm, 0.0, 1.0)
+
+        igds.append(float(igd_plus(A_norm, P_norm)))
+        sps.append(float(spacing_metric(A_norm)))
+
+        tmp_inds = [_TmpInd(o) for o in A_norm.tolist()]
+        hvns.append(float(hv_norm_calc.calculate(tmp_inds)))
+
+    return gens, igds, sps, hvns
+
+
+# ========================
+# 7. NSGA-II core
 # ========================
 
 def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
@@ -1014,8 +876,7 @@ def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
 
         k = random.randint(1, min(max_paths, len(paths)))
         chosen = random.sample(paths, k)
-        raw_allocs = [PathAllocation(path=p, share=random.random())
-                      for p in chosen]
+        raw_allocs = [PathAllocation(path=p, share=random.random()) for p in chosen]
 
         key = (batch.origin, batch.destination, batch.batch_id)
         ind.od_allocations[key] = merge_and_normalize(raw_allocs)
@@ -1023,11 +884,7 @@ def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
 
 
 def dominates(a: Individual, b: Individual) -> bool:
-    """
-    约束支配：
-    - 可行解总是优于不可行解；
-    - 两者同为可行或不可行时，回到标准多目标支配关系。
-    """
+    # constraint-dominance
     if a.feasible and not b.feasible:
         return True
     if b.feasible and not a.feasible:
@@ -1101,21 +958,23 @@ def tournament_select(pop: List[Individual],
 
 
 def run_nsga2_analytics(filename="data.xlsx",
-                        pop_size=50,
-                        generations=100):
+                        pop_size=60,
+                        generations=300,
+                        log_every=10):
+    """
+    Returns:
+      population, pareto_front, batches, history_fronts, stats,
+      plus (final_feasible_nd_objs, all_feasible_front0_objs_over_gens)
+    """
     stats = RunStats()
     t_run0 = time.perf_counter()
 
     print("Loading data...")
     node_names, arcs, timetables, batches = load_network_from_extended(filename)
-
-    print("Pre-processing timetable...")
     tt_dict = build_timetable_dict(timetables)
-
-    print("Building path library...")
     path_lib = build_path_library(node_names, arcs, batches, timetables)
 
-    # 1. 初始种群
+    # init
     t_init0 = time.perf_counter()
     population: List[Individual] = []
     for _ in range(pop_size):
@@ -1126,30 +985,17 @@ def run_nsga2_analytics(filename="data.xlsx",
         dt = time.perf_counter() - t0
         stats.evaluation_time += dt
         stats.evaluation_calls += 1
-        if dt > stats.best_crossover_time:
-            stats.eval_slower_than_best_crossover += 1
 
         population.append(ind)
-        init_feasible = sum(1 for ind in population if ind.feasible)
-        print(f"[INIT] FeasiblePop={init_feasible}/{len(population)}")
-
     stats.init_time = time.perf_counter() - t_init0
 
-    # 2. HV 参考点：根据初始种群的最大值放大 1.2 倍
-    all_objs = np.array([ind.objectives for ind in population], dtype=float)
-    max_vals = np.max(all_objs, axis=0)
-    ref_point = max_vals * 1.2
-    hv_calc = HypervolumeCalculator(ref_point=tuple(ref_point),
-                                    num_samples=10000)
-    print(f"Reference Point for HV set to: {ref_point}")
-
     history_fronts: List[Tuple[int, List[Tuple[float, float, float]]]] = []
-    hv_history: List[float] = []
+    all_feasible_front0_objs: List[Tuple[float, float, float]] = []
 
     for gen in range(generations):
         t_gen0 = time.perf_counter()
 
-        # ---- NDSort timing
+        # NDSort
         t0 = time.perf_counter()
         fronts = non_dominated_sort(population)
         dt = time.perf_counter() - t0
@@ -1157,48 +1003,32 @@ def run_nsga2_analytics(filename="data.xlsx",
         stats.ndsort_calls += 1
 
         front0 = fronts[0]
-
-        # (1) Front0 可行解数
         feasible_front0 = [ind for ind in front0 if ind.feasible]
         base_front = feasible_front0 if feasible_front0 else front0
-
-# (2) Front0 去重后的解数
         front0_unique = unique_individuals_by_objectives(base_front, tol=1e-3)
 
         current_front_objs = [ind.objectives for ind in front0_unique]
         history_fronts.append((gen, current_front_objs))
 
-        t0 = time.perf_counter()
-        current_hv = hv_calc.calculate(front0_unique)
-        dt = time.perf_counter() - t0
-        stats.hv_time += dt
-        stats.hv_calls += 1
+        # collect feasible front0 objs for P*
+        for ind in feasible_front0:
+            all_feasible_front0_objs.append(ind.objectives)
 
-        hv_history.append(current_hv)
-
-# (3) 种群整体可行解数
         feasible_pop = sum(1 for ind in population if ind.feasible)
-
-        best_f1 = min(obj[0] for obj in current_front_objs)
-        print(
-            f"Gen {gen}: Best Cost={best_f1:.0f}, "
-            f"Front0 Unique={len(front0_unique)}, "
-            f"FeasibleInF0={len(feasible_front0)}, "
-            f"FeasiblePop={feasible_pop}/{len(population)}, "
-            f"HV={current_hv:.4f}"
-        )
+        if (gen % log_every == 0) or (gen == generations - 1):
+            print(f"Gen {gen}: Front0Unique={len(front0_unique)} | FeasiblePop={feasible_pop}/{len(population)}")
 
         # ranks
         ranks: Dict[Individual, int] = {}
-        for r, front in enumerate(fronts):
-            for ind in front:
+        for r, f in enumerate(fronts):
+            for ind in f:
                 ranks[ind] = r
 
-        # crowding timing (over all fronts)
+        # crowding
         t0 = time.perf_counter()
         dists: Dict[Individual, float] = {}
-        for front in fronts:
-            dists.update(crowding_distance(front))
+        for f in fronts:
+            dists.update(crowding_distance(f))
         dt = time.perf_counter() - t0
         stats.crowd_time += dt
         stats.crowd_calls += 1
@@ -1255,7 +1085,7 @@ def run_nsga2_analytics(filename="data.xlsx",
                 gen_mutation_time += dt
                 gen_mutation_calls += 1
 
-            # evaluation
+            # evaluation (time each call)
             t0 = time.perf_counter()
             evaluate_individual(c1, batches, path_lib, arcs, tt_dict)
             dt1 = time.perf_counter() - t0
@@ -1279,37 +1109,36 @@ def run_nsga2_analytics(filename="data.xlsx",
             offspring.append(c1)
             offspring.append(c2)
 
+        # environmental selection
         combined = population + offspring
 
         t0 = time.perf_counter()
-        fronts = non_dominated_sort(combined)
+        fronts2 = non_dominated_sort(combined)
         dt = time.perf_counter() - t0
         stats.ndsort_time += dt
         stats.ndsort_calls += 1
 
         new_pop: List[Individual] = []
-        for front in fronts:
-            if len(new_pop) + len(front) <= pop_size:
-                new_pop.extend(front)
+        for f in fronts2:
+            if len(new_pop) + len(f) <= pop_size:
+                new_pop.extend(f)
             else:
                 t0 = time.perf_counter()
-                d = crowding_distance(front)
+                d = crowding_distance(f)
                 dt = time.perf_counter() - t0
                 stats.crowd_time += dt
                 stats.crowd_calls += 1
-
-                front.sort(key=lambda x: d[x], reverse=True)
-                new_pop.extend(front[:pop_size - len(new_pop)])
+                f.sort(key=lambda x: d[x], reverse=True)
+                new_pop.extend(f[:pop_size - len(new_pop)])
                 break
         population = new_pop
 
-        gen_total_time = time.perf_counter() - t_gen0
+        gen_total = time.perf_counter() - t_gen0
         stats.add_gen_record({
             "gen": gen,
             "front0_unique": int(len(front0_unique)),
-            "feasible_in_front0": int(len(feasible_front0)),
-            "hv": float(current_hv),
-            "gen_total_time_s": float(gen_total_time),
+            "feasible_pop": int(sum(1 for ind in population if ind.feasible)),
+            "gen_total_time_s": float(gen_total),
             "gen_crossover_time_s": float(gen_crossover_time),
             "gen_mutation_time_s": float(gen_mutation_time),
             "gen_evaluation_time_s": float(gen_eval_time),
@@ -1318,79 +1147,63 @@ def run_nsga2_analytics(filename="data.xlsx",
             "gen_mutation_calls": int(gen_mutation_calls),
         })
 
+    # final pareto (prefer feasible)
     final_fronts = non_dominated_sort(population)
     front0 = final_fronts[0]
     feasible_front0 = [ind for ind in front0 if ind.feasible]
     base_front = feasible_front0 if feasible_front0 else front0
     pareto_front = unique_individuals_by_objectives(base_front, tol=1e-3)
 
+    # collect final feasible ND objs for P*
+    final_feasible = [ind for ind in pareto_front if ind.feasible]
+    final_feasible_nd_objs = [ind.objectives for ind in (final_feasible if final_feasible else pareto_front)]
+    final_feasible_nd_objs = pareto_filter_objectives(final_feasible_nd_objs, tol=1e-6)
+
     stats.run_total_time = time.perf_counter() - t_run0
 
+    # print timing summary for this run
     print("\n========== TIMING SUMMARY (this run) ==========")
     s = stats.summary_dict()
     for k, v in s.items():
         print(f"{k}: {v}")
     print(f"Final Pareto size (unique, prefer feasible): {len(pareto_front)}")
     print("=============================================\n")
-    print(f"[FINAL] Pareto size (unique, feasible-first) = {len(pareto_front)}")
 
-    return population, pareto_front, batches, history_fronts, hv_history, stats
+    return population, pareto_front, batches, history_fronts, stats, final_feasible_nd_objs, all_feasible_front0_objs
 
 
 # ========================
-# 8. 绘图与输出
+# 8. Output & plots
 # ========================
-
-def print_pure_structure(ind: Individual, batches: List[Batch], sol_name="Solution"):
-    print(f"\n===== {sol_name} 最终结构 (Node+Mode | Share) =====")
-    for batch in batches:
-        key = (batch.origin, batch.destination, batch.batch_id)
-        allocs = ind.od_allocations.get(key, [])
-        if not allocs:
-            continue
-
-        print(f"\nBatch {batch.batch_id}: {batch.origin} -> {batch.destination}, Q={batch.quantity}\n")
-        for a in allocs:
-            print(a)
-
 
 def save_pareto_solutions(pareto: List[Individual],
                           batches: List[Batch],
                           filename: str = "result.txt"):
     pareto = unique_individuals_by_objectives(pareto, tol=1e-3)
-
     with open(filename, "w", encoding="utf-8") as f:
-        f.write("===== NSGA-II Pareto Solutions (All, Unique & Mostly Feasible) =====\n\n")
+        f.write("===== NSGA-II Pareto Solutions (Unique, Feasible-first) =====\n\n")
         for i, ind in enumerate(pareto):
             cost, emit, time_ = ind.objectives
-            f.write(f"===== Pareto Sol {i} =====\n")
-            f.write(f"Objectives: Cost={cost:.2f}, "
-                    f"Emission={emit:.2f}, Time={time_:.2f}, "
-                    f"Penalty={ind.penalty:.2f}, Feasible={ind.feasible}\n\n")
-
+            f.write(f"===== Solution {i} =====\n")
+            f.write(f"Objectives: Cost={cost:.6f}, Emission={emit:.6f}, Time={time_:.6f}, Penalty={ind.penalty:.6f}\n")
+            f.write(f"Feasible={ind.feasible}\n\n")
             for batch in batches:
                 key = (batch.origin, batch.destination, batch.batch_id)
                 allocs = ind.od_allocations.get(key, [])
-                if not allocs:
-                    continue
-
-                f.write(f"Batch {batch.batch_id}: {batch.origin} -> {batch.destination}, Q={batch.quantity}\n\n")
-                for a in allocs:
-                    f.write(str(a) + "\n")
+                if allocs:
+                    f.write(f"Batch {batch.batch_id}: {batch.origin}->{batch.destination} Q={batch.quantity}\n")
+                    for a in allocs:
+                        f.write(str(a) + "\n")
                 f.write("\n")
-
             f.write("\n")
+    print(f"[Saved] {len(pareto)} solutions to {filename}")
 
-    print(f"Saved {len(pareto)} unique Pareto solutions to {filename}")
 
-
-def plot_results(history_fronts, hv_history):
-    fig = plt.figure(figsize=(18, 8))
-
-    ax1 = fig.add_subplot(121, projection='3d')
+def plot_pareto_evolution_3d(history_fronts):
+    fig = plt.figure(figsize=(10, 8))
+    ax1 = fig.add_subplot(111, projection='3d')
     num_gens = len(history_fronts)
-
-    colors = cm.viridis(np.linspace(0, 1, num_gens))
+    colors = cm.viridis(np.linspace(0, 1, max(1, num_gens)))
 
     for gen, objs in history_fronts:
         if not objs:
@@ -1403,229 +1216,269 @@ def plot_results(history_fronts, hv_history):
         s = 20 + 30 * (gen / max(1, num_gens - 1))
 
         label = f"Gen {gen}" if gen in [0, num_gens - 1] else ""
-        ax1.scatter(xs, ys, zs,
-                    color=colors[gen],
-                    alpha=alpha,
-                    s=s,
-                    label=label)
+        ax1.scatter(xs, ys, zs, color=colors[gen], alpha=alpha, s=s, label=label)
 
-    ax1.set_xlabel('Cost ($)')
-    ax1.set_ylabel('Emission (kg)')
-    ax1.set_zlabel('Time (h)')
+    ax1.set_xlabel('Cost')
+    ax1.set_ylabel('Emission')
+    ax1.set_zlabel('Time')
     ax1.set_title('Pareto Front Evolution (Color=Generation)')
     ax1.legend()
-
-    ax2 = fig.add_subplot(122)
-    ax2.plot(range(len(hv_history)),
-             hv_history,
-             marker='o',
-             linestyle='-',
-             markersize=4)
-    ax2.set_xlabel('Generation')
-    ax2.set_ylabel('Hypervolume (0–1, Approx)')
-    ax2.set_title('Convergence Metric (Hypervolume)')
-    ax2.grid(True)
-
     plt.tight_layout()
-
-    ax1.view_init(elev=30, azim=45)
-    plt.savefig('nsga2_view_1_std.png', dpi=300)
-    print("Saved view 1 (Standard): nsga2_view_1_std.png")
-
-    ax1.view_init(elev=20, azim=135)
-    plt.savefig('nsga2_view_2_side.png', dpi=300)
-    print("Saved view 2 (Side): nsga2_view_2_side.png")
-
-    ax1.view_init(elev=60, azim=45)
-    plt.savefig('nsga2_view_3_top.png', dpi=300)
-    print("Saved view 3 (Top-down): nsga2_view_3_top.png")
-
-    ax1.view_init(elev=25, azim=210)
-    plt.savefig('nsga2_view_4_other.png', dpi=300)
-    print("Saved view 4 (Other): nsga2_view_4_other.png")
-
-    plt.show()
+    plt.savefig("pareto_evolution_3d.png", dpi=300)
+    plt.close()
+    print("[Saved] pareto_evolution_3d.png")
 
 
 # ========================
-# 9. 典型 Pareto 解的可视化相关函数
+# 8.1 NEW: line plots (NO shadow) for HV/IGD+/SP
 # ========================
 
-def normalise_objectives(pareto: List[Individual]):
-    objs = np.array([ind.objectives for ind in pareto], dtype=float)
-    mins = objs.min(axis=0)
-    maxs = objs.max(axis=0)
-    ranges = np.where(maxs - mins == 0, 1.0, maxs - mins)
-    norm = (objs - mins) / ranges
-    return norm, mins, maxs
+def _sanitize_series(y: List[float], fallback: float = 0.0) -> np.ndarray:
+    """
+    Make a series plottable:
+    - convert inf/nan -> nan
+    - forward-fill nan
+    - back-fill leading nan
+    - if all nan -> fallback
+    """
+    arr = np.array(y, dtype=float)
+    arr[~np.isfinite(arr)] = np.nan
+
+    if np.all(np.isnan(arr)):
+        return np.full_like(arr, fallback, dtype=float)
+
+    # forward fill
+    for i in range(len(arr)):
+        if np.isnan(arr[i]):
+            if i > 0:
+                arr[i] = arr[i - 1]
+
+    # back fill leading nan (if first entries were nan)
+    if np.isnan(arr[0]):
+        first_valid = None
+        for i in range(len(arr)):
+            if not np.isnan(arr[i]):
+                first_valid = i
+                break
+        if first_valid is None:
+            return np.full_like(arr, fallback, dtype=float)
+        arr[:first_valid] = arr[first_valid]
+
+    # final cleanup
+    arr = np.nan_to_num(arr, nan=fallback, posinf=fallback, neginf=fallback)
+    return arr
 
 
-def select_weighted_solution(pareto: List[Individual],
-                             weights=(0.4, 0.3, 0.3)) -> Tuple[Individual, float]:
-    norm_objs, mins, maxs = normalise_objectives(pareto)
-    w = np.array(weights, dtype=float)
-    w = w / w.sum()
+def plot_single_run_line(series: List[float], title: str, ylabel: str, filename: str,
+                         marker_every: int = 1):
+    y = _sanitize_series(series, fallback=0.0)
+    gens = np.arange(len(y))
 
-    scores = np.dot(norm_objs, w)
-    idx = int(np.argmin(scores))
-    return pareto[idx], float(scores[idx])
+    # 自动减少点的密度，避免太密
+    if marker_every <= 0:
+        marker_every = 1
+    auto_me = max(1, len(gens) // 50)  # 大约最多 50 个marker
+    me = max(marker_every, auto_me)
 
-
-def analyse_solution_modes(ind: Individual, batches: List[Batch]) -> Dict[str, float]:
-    mode_flow: Dict[str, float] = {}
-    for batch in batches:
-        key = (batch.origin, batch.destination, batch.batch_id)
-        allocs = ind.od_allocations.get(key, [])
-        for a in allocs:
-            flow = a.share * batch.quantity
-            for arc in a.path.arcs:
-                k = arc.mode
-                mode_flow[k] = mode_flow.get(k, 0.0) + flow * arc.distance
-    return mode_flow
-
-
-def plot_mode_share(ind: Individual, batches: List[Batch],
-                    filename: str = "typical_solution_mode_share.png"):
-    mode_flow = analyse_solution_modes(ind, batches)
-    modes = list(mode_flow.keys())
-    values = [mode_flow[m] for m in modes]
-
-    plt.figure()
-    plt.bar(modes, values)
-    plt.xlabel("Mode")
-    plt.ylabel("TEU·km in this solution")
-    plt.title("Mode usage of selected Pareto solution")
+    plt.figure(figsize=(8, 5))
+    plt.plot(gens, y, linewidth=2, marker='o', markevery=me)
+    plt.xlabel("Generation")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.savefig(filename, dpi=300)
     plt.close()
-    print(f"Saved mode share figure: {filename}")
+    print(f"[Saved] {filename}")
 
 
-def plot_radar_for_solution(ind: Individual, pareto: List[Individual],
-                            filename: str = "typical_solution_radar.png"):
-    norm_objs, mins, maxs = normalise_objectives(pareto)
-    objs = np.array([p.objectives for p in pareto], dtype=float)
-    target = np.array(ind.objectives, dtype=float)
-    idx = int(np.argmin(np.linalg.norm(objs - target, axis=1)))
-    val = norm_objs[idx]
+def plot_mean_convergence_line(all_run_metrics: List[List[float]],
+                               title: str, ylabel: str, filename: str):
+    """
+    all_run_metrics: list of runs, each is a list over gens.
+    Produces mean line (with markers), NO shadow.
+    """
+    if not all_run_metrics:
+        print(f"[WARN] Empty metrics for {title}, skip.")
+        return
 
-    labels = ["Cost", "Emission", "Time"]
-    angles = np.linspace(0, 2 * np.pi, len(labels) + 1)
-    vals = np.concatenate([val, [val[0]]])
+    clean_runs = []
+    for run in all_run_metrics:
+        clean_runs.append(_sanitize_series(run, fallback=0.0))
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, polar=True)
-    ax.plot(angles, vals)
-    ax.fill(angles, vals, alpha=0.25)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(labels)
-    ax.set_title("Normalised objectives of selected solution")
+    data = np.vstack(clean_runs)  # (runs, gens)
+    mean_curve = np.mean(data, axis=0)
+    gens = np.arange(len(mean_curve))
+
+    me = max(1, len(gens) // 50)  # ~50 markers
+    plt.figure(figsize=(8, 5))
+    plt.plot(gens, mean_curve, linewidth=2, marker='o', markevery=me, label='Mean')
+    plt.xlabel("Generation")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(filename, dpi=300)
     plt.close()
-    print(f"Saved radar figure: {filename}")
+    print(f"[Saved] {filename}")
 
 
 # ========================
-# 10. 多次实验：至少 30 组取平均
+# 9. Main: multi-run experiment with P* and metrics
 # ========================
 
 if __name__ == "__main__":
     filename = "data.xlsx"
     pop_size = 60
-    generations = 200
+    generations = 400
     runs = 30
 
-    all_final_hv: List[float] = []
+    print(f"\nStarting Experiment: Runs={runs}, Gen={generations}, Pop={pop_size}\n")
+
+    # Cache runs
+    cache_runs = []
+
+    # For building global P*
+    all_objs_for_Pstar: List[Tuple[float, float, float]] = []
+
+    # Timing summaries across runs
     all_run_summaries: List[Dict] = []
+
     t_all0 = time.perf_counter()
-
-    best_run_idx = -1
-    best_run_hv = -1.0
-
-    best_pareto = None
-    best_batches = None
-    best_history_fronts = None
-    best_hv_history = None
-    best_stats = None
 
     for run_id in range(runs):
         seed = 1000 + run_id
         random.seed(seed)
         np.random.seed(seed)
 
-        print(f"\n========== RUN {run_id} / {runs-1}, seed={seed} ==========\n")
-        pop, pareto, batches, h_fronts, h_hv, stats = run_nsga2_analytics(
+        print(f"\n========== RUN {run_id}/{runs-1}, seed={seed} ==========\n")
+
+        pop, pareto, batches, h_fronts, stats, final_feas_nd, feas_front0_allgens = run_nsga2_analytics(
             filename=filename,
             pop_size=pop_size,
-            generations=generations
+            generations=generations,
+            log_every=10
         )
 
-        final_hv = h_hv[-1]
-        all_final_hv.append(final_hv)
-        print(f"[RUN {run_id}] Final HV = {final_hv:.4f}, "
-              f"Pareto size = {len(pareto)}")
+        # Build P* candidates:
+        all_objs_for_Pstar.extend(final_feas_nd)
+        all_objs_for_Pstar.extend(pareto_filter_objectives(feas_front0_allgens, tol=1e-6))
 
+        # Store run artifacts
+        cache_runs.append({
+            "run_id": run_id,
+            "seed": seed,
+            "population": pop,
+            "pareto": pareto,
+            "batches": batches,
+            "history_fronts": h_fronts,
+            "stats": stats
+        })
+
+        # Per-run summary
         run_summary = stats.summary_dict()
         run_summary["run_id"] = run_id
         run_summary["seed"] = seed
-        run_summary["final_hv"] = float(final_hv)
         run_summary["final_pareto_size"] = int(len(pareto))
+        run_summary["final_feasible_pareto_size"] = int(sum(1 for ind in pareto if ind.feasible))
         run_summary["eval_over_crossover_ratio"] = float(
             (stats.evaluation_time / stats.crossover_time) if stats.crossover_time > 1e-12 else float("inf")
         )
         all_run_summaries.append(run_summary)
 
-        print(f"[RUN {run_id}] Time total={stats.run_total_time:.2f}s | "
-              f"eval={stats.evaluation_time:.2f}s | cross={stats.crossover_time:.2f}s | "
-              f"mut={stats.mutation_time:.2f}s | hv={stats.hv_time:.2f}s | "
-              f"pareto={len(pareto)}")
+        print(f"[RUN {run_id}] Pareto size={len(pareto)} | "
+              f"Feasible Pareto={run_summary['final_feasible_pareto_size']} | "
+              f"Time total={stats.run_total_time:.2f}s | "
+              f"eval={stats.evaluation_time:.2f}s | cross={stats.crossover_time:.2f}s")
 
-        if final_hv > best_run_hv:
-            best_run_hv = final_hv
-            best_run_idx = run_id
-            best_pareto = pareto
-            best_batches = batches
-            best_history_fronts = h_fronts
-            best_hv_history = h_hv
-            best_stats = stats
+    # Build global P*
+    Pstar = build_reference_front_Pstar(all_objs_for_Pstar)
+    print(f"\n[Global P*] Size: {len(Pstar)}")
 
-    hv_mean = float(np.mean(all_final_hv))
-    hv_std = float(np.std(all_final_hv))
+    # Compute per-generation metrics for each run w.r.t. P*
+    all_runs_igds = []
+    all_runs_sps = []
+    all_runs_hvs = []
 
-    print("\n=========== SUMMARY OVER RUNS ===========")
-    print(f"Runs           : {runs}")
-    print(f"Final HV mean  : {hv_mean:.4f}")
-    print(f"Final HV std   : {hv_std:.4f}")
-    print(f"Best run index : {best_run_idx}")
-    print(f"Best run HV    : {best_run_hv:.4f}")
-    print("=========================================\n")
+    for item in cache_runs:
+        h_fronts = item["history_fronts"]
+        _, igds, sps, hvs = compute_gen_metrics_wrt_Pstar(h_fronts, Pstar, hv_norm_samples=20000)
 
-    total_all_time = time.perf_counter() - t_all0
-    print(f"[TOTAL] All runs wall time = {total_all_time:.2f} seconds")
+        all_runs_igds.append(igds)
+        all_runs_sps.append(sps)
+        all_runs_hvs.append(hvs)
 
+        # attach final metrics for best-run selection
+        item["final_igd_plus"] = float(igds[-1]) if igds else float("inf")
+        item["final_spacing"] = float(sps[-1]) if sps else float("inf")
+        item["final_hv_norm"] = float(hvs[-1]) if hvs else 0.0
+
+    # Select best run by FINAL HV_norm
+    best_item = max(cache_runs, key=lambda x: x.get("final_hv_norm", 0.0))
+    best_run_idx = best_item["run_id"]
+    print(f"\n[Best Run Selection] by final HV_norm: Run={best_run_idx}, HV_norm={best_item['final_hv_norm']:.4f}, "
+          f"IGD+={best_item['final_igd_plus']:.4f}, SP={best_item['final_spacing']:.4f}")
+
+    # =========================
+    # NEW: mean line plots (折线图, 带点) across 30 runs
+    # =========================
+    plot_mean_convergence_line(
+        all_runs_hvs,
+        title=f"HV_norm (Mean over {runs} runs)",
+        ylabel="Hypervolume (Normalised)",
+        filename="hv_norm_mean_line.png"
+    )
+    plot_mean_convergence_line(
+        all_runs_igds,
+        title=f"IGD+ (Mean over {runs} runs)",
+        ylabel="IGD+ (w.r.t. P*)",
+        filename="igd_plus_mean_line.png"
+    )
+    plot_mean_convergence_line(
+        all_runs_sps,
+        title=f"Spacing (Mean over {runs} runs)",
+        ylabel="Spacing (SP)",
+        filename="spacing_mean_line.png"
+    )
+
+    # =========================
+    # NEW: best-run line plots (折线图, 带点)
+    # =========================
+    best_h_fronts = best_item["history_fronts"]
+    _, best_igds, best_sps, best_hvs = compute_gen_metrics_wrt_Pstar(best_h_fronts, Pstar, hv_norm_samples=20000)
+
+    plot_single_run_line(
+        best_hvs,
+        title="HV_norm_Pstar over generations",
+        ylabel="HV_norm_Pstar",
+        filename="best_hv_norm_line.png"
+    )
+    plot_single_run_line(
+        best_igds,
+        title="IGD+ over generations",
+        ylabel="IGD+ (w.r.t. P*)",
+        filename="best_igd_plus_line.png"
+    )
+    plot_single_run_line(
+        best_sps,
+        title="Spacing over generations",
+        ylabel="Spacing (SP)",
+        filename="best_spacing_line.png"
+    )
+
+    # Best run visualisations and outputs
+    best_pareto = best_item["pareto"]
+    best_batches = best_item["batches"]
+
+    plot_pareto_evolution_3d(best_h_fronts)
+    save_pareto_solutions(best_pareto, best_batches, filename="result.txt")
+
+    # Save timing summary CSV
     df_sum = pd.DataFrame(all_run_summaries)
     df_sum.to_csv("timing_summary_runs.csv", index=False)
     print("[Saved] timing_summary_runs.csv")
 
-    if best_pareto is not None:
-        for i, ind in enumerate(best_pareto[:3]):
-            print_pure_structure(ind, best_batches, f"BestRun Pareto Sol {i}")
-
-        save_pareto_solutions(best_pareto, best_batches, filename="result.txt")
-
-        plot_results(best_history_fronts, best_hv_history)
-
-        typical_ind, typical_score = select_weighted_solution(
-            best_pareto, weights=(0.4, 0.3, 0.3)
-        )
-        print("\n=== Selected 'Typical' Solution (w = 0.4, 0.3, 0.3) ===")
-        print("Objectives:", typical_ind.objectives)
-        print("Weighted score (normalised):", typical_score)
-        print_pure_structure(typical_ind, best_batches, "Typical Solution")
-
-        plot_mode_share(typical_ind, best_batches,
-                        filename="typical_solution_mode_share.png")
-
-        plot_radar_for_solution(typical_ind, best_pareto,
-                                filename="typical_solution_radar.png")
+    total_all_time = time.perf_counter() - t_all0
+    print(f"\n[TOTAL] All runs wall time = {total_all_time:.2f} seconds")
+    print("\nAll done.\n")
