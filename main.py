@@ -4,9 +4,11 @@
 import math
 import random
 import time
+import heapq
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, DefaultDict
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -14,17 +16,22 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-
 # ========================
 # Global settings
 # ========================
 
-TIME_BUCKET_H = 1.0  # simulation granularity: 1 hour
+TIME_BUCKET_H = 1.0
 CHINA_REGIONS = {"CN", "China"}
 EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
-BIG_M = 1e6  # big penalty for capacity violation
+BIG_M = 1e6
 
-# ---- Mutation roulette weights (tuneable)
+# 排队/拥堵成本系数
+WAITING_COST_PER_TEU_HOUR = 0.5 
+
+# timetable safety
+HEADWAY_CAP_H = 48.0
+
+# mutation roulette weights
 W_ADD = 0.25
 W_DEL = 0.20
 W_MOD = 0.35
@@ -93,15 +100,6 @@ class PathAllocation:
     path: Path
     share: float
 
-    def __eq__(self, other):
-        if not isinstance(other, PathAllocation):
-            return NotImplemented
-        return (self.path == other.path and abs(self.share - other.share) < 1e-10)
-
-    def __hash__(self):
-        share_for_hash = round(self.share, 10)
-        return hash((self.path, share_for_hash))
-
     def __repr__(self):
         chain = ""
         for i, node in enumerate(self.path.nodes[:-1]):
@@ -113,92 +111,147 @@ class PathAllocation:
 
 @dataclass(eq=False)
 class Individual:
-    # key = (origin, destination, batch_id)
     od_allocations: Dict[Tuple[str, str, int], List[PathAllocation]] = field(default_factory=dict)
-    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))  # (cost, emission, makespan)
+    objectives: Tuple[float, float, float] = (float("inf"), float("inf"), float("inf"))
     penalty: float = 0.0
     feasible: bool = False
+    infeas_reason: Dict[str, int] = field(default_factory=dict)
 
 
 # ========================
-# 2. Core utilities: merge & normalise shares
+# 2. Share utilities
 # ========================
-
-def clone_gene(alloc: PathAllocation) -> PathAllocation:
-    return PathAllocation(path=alloc.path, share=alloc.share)
-
 
 def merge_and_normalize(allocs: List[PathAllocation]) -> List[PathAllocation]:
     if not allocs:
         return []
-
-    merged_map: Dict[Path, float] = {}
+    merged: Dict[Path, float] = {}
     for a in allocs:
-        merged_map[a.path] = merged_map.get(a.path, 0.0) + a.share
+        merged[a.path] = merged.get(a.path, 0.0) + a.share
+    uniq = [PathAllocation(path=p, share=s) for p, s in merged.items()]
 
-    unique_allocs = [PathAllocation(path=p, share=s) for p, s in merged_map.items()]
-
-    total_share = sum(a.share for a in unique_allocs)
-    if total_share <= 1e-9:
-        if not unique_allocs:
-            return []
-        avg = 1.0 / len(unique_allocs)
-        for a in unique_allocs:
+    total = sum(a.share for a in uniq)
+    if total <= 1e-12:
+        avg = 1.0 / len(uniq)
+        for a in uniq:
             a.share = avg
     else:
-        factor = 1.0 / total_share
-        for a in unique_allocs:
-            a.share *= factor
+        inv = 1.0 / total
+        for a in uniq:
+            a.share *= inv
 
-    # remove tiny shares
-    unique_allocs = [a for a in unique_allocs if a.share > 0.001]
+    uniq = [a for a in uniq if a.share > 0.001]
+    if uniq:
+        total2 = sum(a.share for a in uniq)
+        if total2 > 1e-12 and abs(total2 - 1.0) > 1e-6:
+            for a in uniq:
+                a.share /= total2
+    return uniq
 
-    # re-normalise
-    if unique_allocs:
-        final_total = sum(a.share for a in unique_allocs)
-        if abs(final_total - 1.0) > 1e-6 and final_total > 1e-12:
-            for a in unique_allocs:
-                a.share /= final_total
 
-    return unique_allocs
+def clone_gene(a: PathAllocation) -> PathAllocation:
+    return PathAllocation(path=a.path, share=a.share)
 
 
 # ========================
-# 3. Load data + build graph/library
+# 3. Load data
 # ========================
+
+def _detect_node_capacity_columns(nodes_df: pd.DataFrame) -> List[str]:
+    cols = [str(c) for c in nodes_df.columns]
+    cand = []
+    for c in cols:
+        lc = c.lower()
+        if ("teu" in lc) and (("cap" in lc) or ("capacity" in lc) or ("throughput" in lc)):
+            cand.append(c)
+    return cand
+
+
+def _pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {str(c).lower(): str(c) for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
+
 
 def load_network_from_extended(filename: str):
     try:
         xls = pd.ExcelFile(filename)
     except FileNotFoundError:
         raise FileNotFoundError(f"File '{filename}' not found.")
+        
+    DAILY_HOURS = 24.0
 
     # Nodes
     nodes_df = pd.read_excel(xls, "Nodes")
+    # node_names for random DFS compatibility (if needed) but we use Dijkstra
     node_names = nodes_df["EnglishName"].astype(str).tolist()
-    node_region = dict(zip(nodes_df["EnglishName"].astype(str),
-                           nodes_df["Region"].astype(str)))
+    node_region = dict(zip(nodes_df["EnglishName"].astype(str), nodes_df["Region"].astype(str)))
+
+    cap_cols = _detect_node_capacity_columns(nodes_df)
+    node_caps: Dict[str, float] = {}
+    for _, row in nodes_df.iterrows():
+        n = str(row["EnglishName"]).strip()
+        cap_val = None
+        used = None
+        for c in cap_cols:
+            v = row.get(c, np.nan)
+            if pd.notna(v):
+                try:
+                    cap_val = float(v)
+                    used = str(c).lower()
+                    break
+                except Exception:
+                    pass
+        if cap_val is None:
+            node_caps[n] = 1e18
+        else:
+            if used and ("teuh" in used or "hour" in used):
+                node_caps[n] = cap_val * TIME_BUCKET_H
+            else:
+                node_caps[n] = cap_val * (TIME_BUCKET_H / DAILY_HOURS)
+            
+            if node_caps[n] <= 1e-6:
+                node_caps[n] = 1e-6
 
     # Arcs
     arcs_df = pd.read_excel(xls, "Arcs_All")
+
+    speed_col = _pick_first_existing_column(arcs_df, ["Speed_kmh", "SpeedKMH", "AvgSpeed_kmh", "Speed"])
+    time_col  = _pick_first_existing_column(arcs_df, ["TravelTime_h", "Time_h", "TransitTime_h", "Duration_h", "TimeHours"])
+
     arcs: List[Arc] = []
-
-    DAILY_HOURS = 24.0
-
     for _, row in arcs_df.iterrows():
         mode_raw = str(row["Mode"]).strip().lower()
-        speed = 75.0 if mode_raw == "road" else (30.0 if mode_raw == "water" else 50.0)
         mode = "rail" if mode_raw == "rail" else mode_raw
 
         dist_str = str(row["Distance_km"])
         cleaned = "".join(ch for ch in dist_str if (ch.isdigit() or ch == "."))
         distance = float(cleaned) if cleaned else 0.0
 
-        # capacity: TEU/day -> TEU/time-bucket
-        if "Capacity_TEU" in arcs_df.columns and not pd.isna(row["Capacity_TEU"]):
+        speed = None
+        if speed_col is not None and pd.notna(row.get(speed_col, np.nan)):
+            try:
+                speed = float(row[speed_col])
+            except Exception:
+                speed = None
+
+        if speed is None and time_col is not None and pd.notna(row.get(time_col, np.nan)):
+            try:
+                tt = float(row[time_col])
+                if tt > 1e-9 and distance > 1e-9:
+                    speed = distance / tt
+            except Exception:
+                speed = None
+
+        if speed is None:
+            speed = 75.0 if mode == "road" else (30.0 if mode == "water" else 50.0)
+
+        if "Capacity_TEU" in arcs_df.columns and not pd.isna(row.get("Capacity_TEU", np.nan)):
             raw_cap = float(row["Capacity_TEU"])
         else:
-            raw_cap = 1e9
+            raw_cap = 1e18
         capacity = raw_cap * (TIME_BUCKET_H / DAILY_HOURS)
 
         arcs.append(Arc(
@@ -209,7 +262,7 @@ def load_network_from_extended(filename: str):
             capacity=capacity,
             cost_per_teu_km=float(row["Cost_$_per_km"]),
             emission_per_teu_km=float(row["Emission_gCO2_per_tkm"]),
-            speed_kmh=speed
+            speed_kmh=float(max(speed, 1.0)),
         ))
 
     # Timetable
@@ -217,10 +270,14 @@ def load_network_from_extended(filename: str):
     timetables: List[TimetableEntry] = []
     for _, row in tdf.iterrows():
         freq = float(row["Frequency_per_week"])
-        hd = row["Headway_Hours"]
-        hd = 168.0 / max(freq, 1.0) if pd.isna(hd) else float(hd)
+        hd = row.get("Headway_Hours", np.nan)
+        if pd.isna(hd):
+            hd = 168.0 / max(freq, 1.0)
+        else:
+            hd = float(hd)
+        hd = min(float(hd), HEADWAY_CAP_H)
 
-        v = row["FirstDepartureHour"]
+        v = row.get("FirstDepartureHour", np.nan)
         fd = 0.0
         if not pd.isna(v):
             try:
@@ -233,252 +290,487 @@ def load_network_from_extended(filename: str):
             to_node=str(row["DestEN"]).strip(),
             mode=str(row["Mode"]).strip().lower(),
             frequency_per_week=freq,
-            first_departure_hour=fd,
-            headway_hours=hd
+            first_departure_hour=float(fd),
+            headway_hours=float(hd)
         ))
 
     # Batches
     bdf = pd.read_excel(xls, "Batches")
+    lt_vals = []
+    for v in bdf["LT"].values.tolist():
+        try:
+            if pd.notna(v):
+                lt_vals.append(float(v))
+        except Exception:
+            pass
+    infer_days = False
+    if lt_vals:
+        med_lt = float(np.median(np.array(lt_vals, dtype=float)))
+        infer_days = (med_lt <= 30.0)
+
+    if infer_days:
+        print("[INFO] Detected ET/LT likely in DAYS (median LT<=30). Auto converting to HOURS (*24).")
+    else:
+        print("[INFO] Detected ET/LT likely in HOURS (median LT>30). Keep as-is.")
+
     batches: List[Batch] = []
     for _, row in bdf.iterrows():
         origin = str(row["OriginEN"]).strip()
         dest = str(row["DestEN"]).strip()
         o_reg = node_region.get(origin)
         d_reg = node_region.get(dest)
-
         if o_reg in CHINA_REGIONS and d_reg in EUROPE_REGIONS:
+            ET_raw = float(row["ET"])
+            LT_raw = float(row["LT"])
+            ET = ET_raw * 24.0 if infer_days else ET_raw
+            LT = LT_raw * 24.0 if infer_days else LT_raw
             batches.append(Batch(
                 batch_id=int(row["BatchID"]),
                 origin=origin,
                 destination=dest,
                 quantity=float(row["QuantityTEU"]),
-                ET=float(row["ET"]),
-                LT=float(row["LT"])
+                ET=float(ET),
+                LT=float(LT)
             ))
 
     print(f"[INFO] Number of batches loaded: {len(batches)}")
-    return node_names, arcs, timetables, batches
+    return node_names, node_caps, arcs, timetables, batches
 
 
-def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
-    g: Dict[str, List[Tuple[str, Arc]]] = {}
+# ========================
+# 4. Graph + timetable dict + Path Library (Dijkstra)
+# ========================
+
+def build_graph(arcs: List[Arc]) -> Dict[str, List[Arc]]:
+    g: Dict[str, List[Arc]] = {}
     for a in arcs:
-        g.setdefault(a.from_node, []).append((a.to_node, a))
+        g.setdefault(a.from_node, []).append(a)
     return g
 
 
 def build_timetable_dict(timetables: List[TimetableEntry]) -> Dict[Tuple[str, str, str], List[TimetableEntry]]:
-    tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]] = {}
+    tt: Dict[Tuple[str, str, str], List[TimetableEntry]] = {}
     for t in timetables:
-        key = (t.from_node, t.to_node, t.mode)
-        tt_dict.setdefault(key, []).append(t)
-    return tt_dict
+        tt.setdefault((t.from_node, t.to_node, t.mode), []).append(t)
+    return tt
 
 
-def random_dfs_paths(graph, origin, dest, max_len=8, max_paths=50) -> List[List[Arc]]:
-    paths: List[List[Arc]] = []
-
-    def dfs(node, cur_arcs, visited):
-        if len(paths) >= max_paths or len(cur_arcs) > max_len:
-            return
-        if node == dest and cur_arcs:
-            paths.append(cur_arcs.copy())
-            return
-
-        neighbors = graph.get(node, [])
-        random.shuffle(neighbors)
-
-        for nxt, arc in neighbors:
-            if nxt in visited:
-                continue
-            dfs(nxt, cur_arcs + [arc], visited | {nxt})
-
-    dfs(origin, [], {origin})
-    return paths
-
-
-def build_path_library(node_names, arcs, batches, timetables) -> Dict[Tuple[str, str], List[Path]]:
-    graph = build_graph(arcs)
-    path_lib: Dict[Tuple[str, str], List[Path]] = {}
-    next_path_id = 0
-
-    for batch in batches:
-        od = (batch.origin, batch.destination)
-        if od in path_lib:
-            continue
-
-        arc_paths = random_dfs_paths(graph, batch.origin, batch.destination)
-        paths_for_od: List[Path] = []
-
-        for arc_seq in arc_paths:
-            nodes = [arc_seq[0].from_node] + [a.to_node for a in arc_seq]
-            modes = [a.mode for a in arc_seq]
-
-            paths_for_od.append(Path(
-                path_id=next_path_id,
-                origin=batch.origin,
-                destination=batch.destination,
-                nodes=nodes,
-                modes=modes,
-                arcs=arc_seq,
-                base_cost_per_teu=sum(a.cost_per_teu_km * a.distance for a in arc_seq),
-                base_emission_per_teu=sum(a.emission_per_teu_km * a.distance for a in arc_seq),
-                base_travel_time_h=sum(a.distance / max(a.speed_kmh, 1.0) for a in arc_seq),
-            ))
-            next_path_id += 1
-
-        if paths_for_od:
-            paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
-            path_lib[od] = paths_for_od[:20]
-
-    return path_lib
-
-
-# ========================
-# 4. Evaluation (objectives + feasibility)
-# ========================
-
-def simulate_path_time_capacity(path: Path, batch: Batch, flow: float, tt_dict,
-                                arc_flow_map) -> float:
-    """
-    - Road: depart immediately (ignore timetable)
-    - Rail/Water: wait for next departure (simplified to first timetable entry)
-    """
-    t = batch.ET
-    for arc in path.arcs:
-        travel_time = arc.distance / max(arc.speed_kmh, 1.0)
-
-        if arc.mode == "road":
-            entries = []
+def next_departure_time(current_t: float, entries: List[TimetableEntry]) -> float:
+    if not entries:
+        return current_t
+    best = float("inf")
+    for e in entries:
+        fd = float(e.first_departure_hour)
+        hd = float(max(e.headway_hours, 1e-6))
+        if current_t <= fd + 1e-12:
+            dep = fd
         else:
-            key = (arc.from_node, arc.to_node, arc.mode)
-            entries = tt_dict.get(key, [])
+            n = math.ceil((current_t - fd - 1e-10) / hd)
+            dep = fd + n * hd
+        best = min(best, dep)
+    return best
 
-        if not entries:
+
+def simulate_time_only(path: Path, ET: float, tt_dict) -> float:
+    t = ET
+    for arc in path.arcs:
+        travel = arc.distance / max(arc.speed_kmh, 1.0)
+        if arc.mode == "road":
             dep = t
         else:
-            e = entries[0]
-            if t <= e.first_departure_hour:
-                dep = e.first_departure_hour
+            dep = next_departure_time(t, tt_dict.get((arc.from_node, arc.to_node, arc.mode), []))
+        t = dep + travel
+    return t - ET
+
+
+def dijkstra_time_dependent(graph: Dict[str, List[Arc]], origin: str, dest: str,
+                            start_time: float, tt_dict,
+                            mode_weights: Optional[Dict[str, float]] = None,
+                            max_hops: int = 50) -> Optional[List[Arc]]:
+    pq = []
+    heapq.heappush(pq, (start_time, start_time, origin, 0))
+
+    min_arrival = {origin: start_time}
+    prev: Dict[str, Tuple[str, Arc]] = {}
+    
+    if mode_weights is None:
+        mode_weights = {}
+
+    while pq:
+        _, curr_real_time, u, hops = heapq.heappop(pq)
+
+        if u == dest:
+            break
+
+        if curr_real_time > min_arrival.get(u, float("inf")) + 48.0:
+            continue
+
+        if hops >= max_hops:
+            continue
+
+        for arc in graph.get(u, []):
+            v = arc.to_node
+
+            if arc.mode == "road":
+                dep_time = curr_real_time
             else:
-                waited = (t - e.first_departure_hour)
-                n = math.ceil(waited / e.headway_hours)
-                dep = e.first_departure_hour + n * e.headway_hours
+                raw_dep = next_departure_time(curr_real_time, tt_dict.get((u, v, arc.mode), []))
+                if raw_dep == float("inf"):
+                    continue
+                dep_time = raw_dep
 
-        arr = dep + travel_time
+            travel_time = arc.distance / max(arc.speed_kmh, 1.0)
+            
+            mw = mode_weights.get(arc.mode, 1.0)
+            perceived_travel = travel_time * mw
+                
+            real_arrival_time = dep_time + travel_time
+            
+            priority_metric = dep_time + perceived_travel 
+            priority_metric *= (1.0 + random.uniform(-0.02, 0.02))
 
-        start_slot = int(dep)
-        key = (arc.from_node, arc.to_node, arc.mode)
-        slot_key = (key, start_slot)
-        arc_flow_map[slot_key] = arc_flow_map.get(slot_key, 0) + flow
+            if real_arrival_time < min_arrival.get(v, float("inf")):
+                min_arrival[v] = real_arrival_time
+                prev[v] = (u, arc)
+                
+                heapq.heappush(pq, (priority_metric, real_arrival_time, v, hops + 1))
 
-        t = arr
+    if dest not in prev:
+        return None
 
-    return t - batch.ET
+    arcs_seq = []
+    cur = dest
+    while cur != origin:
+        if cur not in prev:
+            return None
+        pu, arc = prev[cur]
+        arcs_seq.append(arc)
+        cur = pu
+    arcs_seq.reverse()
+    return arcs_seq
 
 
-def evaluate_individual(ind: Individual, batches, path_lib, arcs, tt_dict):
+def build_path_library(arcs: List[Arc], batches: List[Batch], tt_dict,
+                       K: int = 100, repeats: int = 40) -> Dict[Tuple[str, str], List[Path]]:
+    graph = build_graph(arcs)
+    lib: Dict[Tuple[str, str], List[Path]] = {}
+    pid = 0
+    
+    print(f"[INFO] Building Diverse Time-Dependent Path Library for {len(batches)} batches...", flush=True)
+    
+    count_new = 0
+
+    for i, b in enumerate(batches):
+        od = (b.origin, b.destination)
+        if od not in lib:
+            lib[od] = []
+            
+        existing_signatures = set()
+        for p in lib[od]:
+            existing_signatures.add((tuple(p.nodes), tuple(p.modes)))
+
+        found_seqs = []
+        
+        base = dijkstra_time_dependent(graph, b.origin, b.destination, b.ET, tt_dict, mode_weights=None)
+        if base:
+            found_seqs.append(base)
+            
+        for _ in range(repeats):
+            mw = {
+                "road": random.choice([1.0, 1.0, 3.0, 5.0, 10.0]), 
+                "rail": random.choice([1.0, 1.0, 2.0, 5.0]),
+                "water": random.choice([0.5, 0.8, 1.0, 2.0])
+            }
+            seq = dijkstra_time_dependent(graph, b.origin, b.destination, b.ET, tt_dict, mode_weights=mw)
+            if seq:
+                found_seqs.append(seq)
+                
+        for seq in found_seqs:
+            nodes = [seq[0].from_node] + [a.to_node for a in seq]
+            modes = [a.mode for a in seq]
+            sig = (tuple(nodes), tuple(modes))
+            
+            if sig not in existing_signatures:
+                cost = sum(a.cost_per_teu_km * a.distance for a in seq)
+                emis = sum(a.emission_per_teu_km * a.distance for a in seq)
+                tt_base = sum(a.distance / max(a.speed_kmh, 1.0) for a in seq)
+                
+                new_p = Path(
+                    path_id=pid,
+                    origin=b.origin,
+                    destination=b.destination,
+                    nodes=nodes,
+                    modes=modes,
+                    arcs=seq,
+                    base_cost_per_teu=cost,
+                    base_emission_per_teu=emis,
+                    base_travel_time_h=tt_base
+                )
+                pid += 1
+                lib[od].append(new_p)
+                existing_signatures.add(sig)
+                count_new += 1
+                
+        if len(lib[od]) > K * 2:
+             lib[od] = lib[od][:K*2]
+
+        if (i + 1) % 1 == 0:
+            print(f"  Processed {i+1}/{len(batches)} batches... (Found {count_new} paths so far)", flush=True)
+
+    print(f"[INFO] Path library built. Total unique paths across all ODs: {sum(len(v) for v in lib.values())}")
+    return lib
+
+
+def report_time_feasible_coverage(batches, path_lib, tt_dict):
+    bad = []
+    print("\n[TIME FEASIBILITY CHECK] per-batch coverage:")
+    for b in batches:
+        od = (b.origin, b.destination)
+        paths = path_lib.get(od, [])
+        if not paths:
+            print(f"  Batch {b.batch_id}: NO PATHS in library!")
+            bad.append((b.batch_id, "no_paths"))
+            continue
+
+        feas_cnt = 0
+        best_arr = float("inf")
+        for p in paths:
+            arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+            best_arr = min(best_arr, arr)
+            if arr <= b.LT + 1e-9:
+                feas_cnt += 1
+
+        status = "OK" if feas_cnt > 0 else "IMPOSSIBLE"
+        if feas_cnt == 0:
+            print(f"  Batch {b.batch_id}: feas_paths={feas_cnt}/{len(paths)} | ET={b.ET:.1f}, LT={b.LT:.1f}, best_arr={best_arr:.1f} -> {status}")
+            bad.append((b.batch_id, b.origin, b.destination, b.ET, b.LT, best_arr))
+    
+    if bad:
+        print(f"\n[WARNING] {len(bad)} batches have ZERO time-feasible paths.")
+    else:
+        print("\n[SUCCESS] All batches have at least one time-feasible path.")
+    print()
+    return bad
+
+
+# ========================
+# 6. Evaluation with Queueing (Congestion -> Delay -> Cost/Lateness)
+# ========================
+
+def evaluate_individual(ind: Individual, batches: List[Batch], arcs: List[Arc], tt_dict, node_caps: Dict[str, float]):
     total_cost = 0.0
-    total_emission = 0.0
+    total_emis = 0.0
     makespan = 0.0
 
-    arc_flow_map: Dict[Tuple[Tuple[str, str, str], int], float] = {}
-    arc_caps = {(a.from_node, a.to_node, a.mode): a.capacity for a in arcs}
-
     penalty = 0.0
+    missing = False
+    late = False
 
-    missing_alloc_violation = False
-    late_violation = False
-    capacity_violation = False
+    tasks = []
+    
+    for b in batches:
+        key = (b.origin, b.destination, b.batch_id)
+        allocs = ind.od_allocations.get(key, [])
+        
+        if not allocs:
+            penalty += 1e9
+            missing = True
+            continue
+            
+        for a in allocs:
+            if a.share <= 1e-12:
+                continue
+            qty = a.share * b.quantity
+            tasks.append({
+                "start_time": b.ET,
+                "quantity": qty,
+                "path": a.path,
+                "batch": b
+            })
 
-    for batch in batches:
-        key = (batch.origin, batch.destination, batch.batch_id)
+    tasks.sort(key=lambda x: x["start_time"])
+
+    node_next_free_time: Dict[str, float] = defaultdict(float)
+
+    for task in tasks:
+        curr_t = task["start_time"]
+        qty = task["quantity"]
+        path = task["path"]
+        batch = task["batch"]
+        
+        total_cost += path.base_cost_per_teu * qty
+        total_emis += path.base_emission_per_teu * qty
+        
+        path_wait_cost = 0.0
+        
+        for arc in path.arcs:
+            travel = arc.distance / max(arc.speed_kmh, 1.0)
+            
+            if arc.mode == "road":
+                dep = curr_t
+            else:
+                dep = next_departure_time(curr_t, tt_dict.get((arc.from_node, arc.to_node, arc.mode), []))
+            
+            # Timetable waiting cost
+            timetable_wait = dep - curr_t
+            path_wait_cost += timetable_wait * qty * WAITING_COST_PER_TEU_HOUR
+
+            arr_at_next = dep + travel
+            
+            # Congestion logic
+            next_node = arc.to_node
+            proc_rate = node_caps.get(next_node, 1e18)
+            service_time = qty / proc_rate
+            
+            node_free = node_next_free_time[next_node]
+            start_service_time = max(arr_at_next, node_free)
+            
+            wait_time = start_service_time - arr_at_next
+            finish_service_time = start_service_time + service_time
+            node_next_free_time[next_node] = finish_service_time
+            
+            curr_t = finish_service_time
+            
+            # Queueing waiting cost
+            path_wait_cost += wait_time * qty * WAITING_COST_PER_TEU_HOUR
+
+        final_arrival = curr_t
+        total_cost += path_wait_cost
+        
+        makespan = max(makespan, final_arrival)
+
+        if final_arrival > batch.LT + 1e-9:
+            late = True
+            penalty += (final_arrival - batch.LT) * 500.0
+
+    ind.objectives = (total_cost + penalty, total_emis + penalty, makespan)
+    ind.penalty = penalty
+    ind.feasible = not (missing or late)
+    ind.infeas_reason = {
+        "missing_alloc": int(missing),
+        "late": int(late),
+        "arc_cap": 0,
+        "node_cap": 0
+    }
+
+
+# ========================
+# 7. Repair & GA Operators
+# ========================
+
+def repair_individual(ind: Individual, batches: List[Batch], path_lib, tt_dict):
+    for b in batches:
+        od = (b.origin, b.destination)
+        key = (b.origin, b.destination, b.batch_id)
+        paths = path_lib.get(od, [])
+        if not paths:
+            continue
+
         allocs = ind.od_allocations.get(key, [])
 
         if not allocs:
-            penalty += 1e9
-            missing_alloc_violation = True
+            best = None
+            best_arr = float("inf")
+            best_feas = None
+            best_feas_arr = float("inf")
+
+            for p in paths:
+                arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+                if arr < best_arr:
+                    best_arr = arr
+                    best = p
+                if arr <= b.LT + 1e-9 and arr < best_feas_arr:
+                    best_feas_arr = arr
+                    best_feas = p
+
+            chosen = best_feas if best_feas else best
+            if chosen:
+                ind.od_allocations[key] = [PathAllocation(path=chosen, share=1.0)]
             continue
 
-        batch_finish_time = 0.0
-
-        for alloc in allocs:
-            if alloc.share <= 1e-6:
+        kept = []
+        for a in allocs:
+            if a.share <= 1e-12:
                 continue
+            arr = b.ET + simulate_time_only(a.path, b.ET, tt_dict)
+            if arr <= b.LT + 1e-9:
+                kept.append(a)
 
-            flow = alloc.share * batch.quantity
-            path = alloc.path
+        if kept:
+            ind.od_allocations[key] = merge_and_normalize(kept)
+        else:
+            best = None
+            best_arr = float("inf")
+            best_feas = None
+            best_feas_arr = float("inf")
 
-            total_cost += path.base_cost_per_teu * flow
-            total_emission += path.base_emission_per_teu * flow
-
-            travel_time = simulate_path_time_capacity(path, batch, flow, tt_dict, arc_flow_map)
-            arrival_time = batch.ET + travel_time
-
-            batch_finish_time = max(batch_finish_time, arrival_time)
-
-            if arrival_time > batch.LT:
-                penalty += (arrival_time - batch.LT) * 1000.0
-                late_violation = True
-
-        makespan = max(makespan, batch_finish_time)
-
-    for (key, slot), flow in arc_flow_map.items():
-        cap = arc_caps.get(key, 1e9)
-        if flow > cap:
-            penalty += (flow - cap) * BIG_M
-            capacity_violation = True
-
-    ind.objectives = (total_cost + penalty,
-                      total_emission + penalty,
-                      makespan)
-    ind.penalty = penalty
-    ind.feasible = not (missing_alloc_violation or late_violation or capacity_violation)
+            for p in paths:
+                arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+                if arr < best_arr:
+                    best_arr = arr
+                    best = p
+                if arr <= b.LT + 1e-9 and arr < best_feas_arr:
+                    best_feas_arr = arr
+                    best_feas = p
+            
+            chosen = best_feas if best_feas else best
+            if chosen:
+                ind.od_allocations[key] = [PathAllocation(path=chosen, share=1.0)]
 
 
-# ========================
-# 5. Genetic operators
-# ========================
-
-def crossover_structural(ind1: Individual, ind2: Individual,
-                         batches: List[Batch]) -> Tuple[Individual, Individual]:
-    """
-    Fragment crossover per batch key; share fixed by merge_and_normalize.
-    """
-    child1 = Individual()
-    child2 = Individual()
-
-    for batch in batches:
-        key = (batch.origin, batch.destination, batch.batch_id)
-        genes1 = ind1.od_allocations.get(key, [])
-        genes2 = ind2.od_allocations.get(key, [])
-
-        if not genes1 and not genes2:
-            continue
-        if not genes1:
-            child1.od_allocations[key] = [clone_gene(g) for g in genes2]
-            child2.od_allocations[key] = [clone_gene(g) for g in genes2]
-            continue
-        if not genes2:
-            child1.od_allocations[key] = [clone_gene(g) for g in genes1]
-            child2.od_allocations[key] = [clone_gene(g) for g in genes1]
+def random_initial_individual(batches, path_lib, tt_dict, max_paths=3) -> Individual:
+    ind = Individual()
+    for b in batches:
+        od = (b.origin, b.destination)
+        paths = path_lib.get(od, [])
+        if not paths:
             continue
 
-        cut1 = random.randint(0, len(genes1))
-        cut2 = random.randint(0, len(genes2))
+        feas = []
+        for p in paths:
+            arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+            if arr <= b.LT + 1e-9:
+                feas.append(p)
+        pool = feas if feas else paths
 
-        c1_genes = [clone_gene(g) for g in genes1[:cut1]] + \
-                   [clone_gene(g) for g in genes2[cut2:]]
-        c2_genes = [clone_gene(g) for g in genes2[:cut2]] + \
-                   [clone_gene(g) for g in genes1[cut1:]]
+        k = random.randint(1, min(max_paths, len(pool)))
+        chosen = random.sample(pool, k)
+        key = (b.origin, b.destination, b.batch_id)
+        ind.od_allocations[key] = merge_and_normalize([PathAllocation(path=p, share=random.random()) for p in chosen])
 
-        child1.od_allocations[key] = merge_and_normalize(c1_genes)
-        child2.od_allocations[key] = merge_and_normalize(c2_genes)
-
-    return child1, child2
+    repair_individual(ind, batches, path_lib, tt_dict)
+    return ind
 
 
-# ---- Mutation caches
+def crossover_structural(ind1: Individual, ind2: Individual, batches: List[Batch]) -> Tuple[Individual, Individual]:
+    c1 = Individual()
+    c2 = Individual()
+    for b in batches:
+        key = (b.origin, b.destination, b.batch_id)
+        g1 = ind1.od_allocations.get(key, [])
+        g2 = ind2.od_allocations.get(key, [])
+        if not g1 and not g2:
+            continue
+        if not g1:
+            c1.od_allocations[key] = [clone_gene(x) for x in g2]
+            c2.od_allocations[key] = [clone_gene(x) for x in g2]
+            continue
+        if not g2:
+            c1.od_allocations[key] = [clone_gene(x) for x in g1]
+            c2.od_allocations[key] = [clone_gene(x) for x in g1]
+            continue
+
+        cut1 = random.randint(0, len(g1))
+        cut2 = random.randint(0, len(g2))
+        gg1 = [clone_gene(x) for x in g1[:cut1]] + [clone_gene(x) for x in g2[cut2:]]
+        gg2 = [clone_gene(x) for x in g2[:cut2]] + [clone_gene(x) for x in g1[cut1:]]
+        c1.od_allocations[key] = merge_and_normalize(gg1)
+        c2.od_allocations[key] = merge_and_normalize(gg2)
+
+    return c1, c2
+
+
+# mutation caches
 _ARC_LOOKUP: Dict[Tuple[str, str, str], Arc] = {}
 _ARC_MODE_OPTIONS: Dict[Tuple[str, str], List[str]] = {}
 _CACHE_BUILT = False
@@ -488,18 +780,13 @@ def _build_arc_caches_from_path_lib(path_lib: Dict[Tuple[str, str], List[Path]])
     global _ARC_LOOKUP, _ARC_MODE_OPTIONS, _CACHE_BUILT
     if _CACHE_BUILT:
         return
-
-    arc_lookup: Dict[Tuple[str, str, str], Arc] = {}
+    arc_lookup = {}
     mode_opts: Dict[Tuple[str, str], set] = {}
-
     for _, paths in path_lib.items():
         for p in paths:
             for a in p.arcs:
-                k3 = (a.from_node, a.to_node, a.mode)
-                arc_lookup[k3] = a
-                k2 = (a.from_node, a.to_node)
-                mode_opts.setdefault(k2, set()).add(a.mode)
-
+                arc_lookup[(a.from_node, a.to_node, a.mode)] = a
+                mode_opts.setdefault((a.from_node, a.to_node), set()).add(a.mode)
     _ARC_LOOKUP = arc_lookup
     _ARC_MODE_OPTIONS = {k: sorted(list(v)) for k, v in mode_opts.items()}
     _CACHE_BUILT = True
@@ -515,19 +802,15 @@ def _roulette_choice(items: List[Tuple[str, float]]) -> str:
     return str(np.random.choice(names, p=w))
 
 
-def _mut_add_path(allocs: List[PathAllocation], od: Tuple[str, str],
-                  path_lib: Dict[Tuple[str, str], List[Path]]):
-    paths_in_lib = path_lib.get(od, [])
-    if not paths_in_lib:
+def _mut_add_path(allocs: List[PathAllocation], od: Tuple[str, str], path_lib):
+    paths = path_lib.get(od, [])
+    if not paths:
         return allocs
-
-    current_structures = {a.path for a in allocs}
-    candidates = [p for p in paths_in_lib if p not in current_structures]
-    if not candidates:
+    cur = {a.path for a in allocs}
+    cand = [p for p in paths if p not in cur]
+    if not cand:
         return allocs
-
-    new_path = random.choice(candidates)
-    allocs.append(PathAllocation(path=new_path, share=0.2))
+    allocs.append(PathAllocation(path=random.choice(cand), share=0.2))
     return merge_and_normalize(allocs)
 
 
@@ -541,34 +824,31 @@ def _mut_delete_path(allocs: List[PathAllocation]):
 def _mut_modify_share(allocs: List[PathAllocation]):
     if not allocs:
         return allocs
-    target = random.choice(allocs)
-    target.share *= random.uniform(0.5, 1.5)
+    a = random.choice(allocs)
+    a.share *= random.uniform(0.5, 1.5)
     return merge_and_normalize(allocs)
 
 
 def _mut_mode_single_arc(allocs: List[PathAllocation]):
     if not allocs:
         return allocs
-
     a = random.choice(allocs)
     p = a.path
     if not p.arcs:
         return allocs
 
     pos = random.randrange(len(p.arcs))
-    old_arc = p.arcs[pos]
-    u, v = old_arc.from_node, old_arc.to_node
-    old_mode = old_arc.mode
+    old = p.arcs[pos]
+    u, v = old.from_node, old.to_node
+    old_mode = old.mode
 
     modes = _ARC_MODE_OPTIONS.get((u, v), [])
     if len(modes) <= 1:
         return allocs
-
-    other_modes = [m for m in modes if m != old_mode]
-    if not other_modes:
+    other = [m for m in modes if m != old_mode]
+    if not other:
         return allocs
-
-    new_mode = random.choice(other_modes)
+    new_mode = random.choice(other)
     new_arc = _ARC_LOOKUP.get((u, v, new_mode))
     if new_arc is None:
         return allocs
@@ -576,10 +856,7 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
     new_arcs = list(p.arcs)
     new_arcs[pos] = new_arc
     new_modes = list(p.modes)
-    if pos < len(new_modes):
-        new_modes[pos] = new_mode
-    else:
-        return allocs
+    new_modes[pos] = new_mode
 
     new_path = Path(
         path_id=-1,
@@ -594,31 +871,25 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
     )
 
     for i in range(len(allocs)):
-        if allocs[i] == a:
+        if allocs[i].path == a.path and abs(allocs[i].share - a.share) < 1e-12:
             allocs[i] = PathAllocation(path=new_path, share=a.share)
             break
-
     return merge_and_normalize(allocs)
 
 
-def mutate_structural(ind: Individual, batches: List[Batch],
-                      path_lib: Dict[Tuple[str, str], List[Path]]):
-    """
-    Roulette among: add / del / modify-share / change-mode(one arc)
-    """
+def mutate_structural(ind: Individual, batches: List[Batch], path_lib):
     _build_arc_caches_from_path_lib(path_lib)
-
-    batch = random.choice(batches)
-    od = (batch.origin, batch.destination)
-    key = (batch.origin, batch.destination, batch.batch_id)
+    if not batches:
+        return
+    b = random.choice(batches)
+    key = (b.origin, b.destination, b.batch_id)
+    od = (b.origin, b.destination)
 
     allocs = ind.od_allocations.get(key, [])
-    paths_in_lib = path_lib.get(od, [])
-    if not paths_in_lib:
+    if not path_lib.get(od, []):
         return
 
     can_del = len(allocs) > 1
-
     op = _roulette_choice([
         ("add", W_ADD),
         ("del", W_DEL if can_del else 0.0),
@@ -639,14 +910,10 @@ def mutate_structural(ind: Individual, batches: List[Batch],
 
 
 # ========================
-# 6. Metrics & timing
+# 8. Metrics & timing (NEW)
 # ========================
 
 class HypervolumeCalculator:
-    """
-    Monte-Carlo HV within [0, ref_point]^m, returns dominated sample ratio (0..1).
-    Use ONLY on normalised objectives (e.g., within [0,1]) for meaningful values.
-    """
     def __init__(self, ref_point: Tuple[float, float, float], num_samples=20000):
         self.ref_point = np.array(ref_point, dtype=float)
         self.num_samples = int(num_samples)
@@ -678,8 +945,7 @@ class HypervolumeCalculator:
         return float(ratio)
 
 
-def unique_individuals_by_objectives(front: List[Individual],
-                                     tol: float = 1e-3) -> List[Individual]:
+def unique_individuals_by_objectives(front: List[Individual], tol: float = 1e-3) -> List[Individual]:
     unique: List[Individual] = []
     seen_objs: List[Tuple[float, float, float]] = []
 
@@ -705,7 +971,7 @@ class RunStats:
     init_time: float = 0.0
     ndsort_time: float = 0.0
     crowd_time: float = 0.0
-    hv_time: float = 0.0          # optional debug hv timing
+    hv_time: float = 0.0
     crossover_time: float = 0.0
     mutation_time: float = 0.0
     evaluation_time: float = 0.0
@@ -746,10 +1012,6 @@ class RunStats:
         }
 
 
-# ========================
-# 6.2 Reference-front P*, normalisation, IGD+, Spacing, HV_norm
-# ========================
-
 def _dominates_obj(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> bool:
     return all(x <= y for x, y in zip(a, b)) and any(x < y for x, y in zip(a, b))
 
@@ -758,7 +1020,6 @@ def pareto_filter_objectives(objs: List[Tuple[float, float, float]], tol: float 
     if not objs:
         return []
 
-    # de-dup
     uniq = []
     for o in objs:
         ok = True
@@ -769,7 +1030,6 @@ def pareto_filter_objectives(objs: List[Tuple[float, float, float]], tol: float 
         if ok:
             uniq.append(o)
 
-    # non-dominated
     nd = []
     for i, a in enumerate(uniq):
         dominated = False
@@ -788,8 +1048,7 @@ def build_reference_front_Pstar(all_feasible_nd_objs: List[Tuple[float, float, f
     return pareto_filter_objectives(all_feasible_nd_objs, tol=1e-6)
 
 
-def normalise_by_Pstar(A_objs: List[Tuple[float, float, float]],
-                       Pstar: List[Tuple[float, float, float]]):
+def normalise_by_Pstar(A_objs: List[Tuple[float, float, float]], Pstar: List[Tuple[float, float, float]]):
     A = np.array(A_objs, dtype=float)
     P = np.array(Pstar, dtype=float)
     mins = P.min(axis=0)
@@ -800,11 +1059,6 @@ def normalise_by_Pstar(A_objs: List[Tuple[float, float, float]],
 
 
 def igd_plus(A_norm: np.ndarray, P_norm: np.ndarray) -> float:
-    """
-    IGD+:
-      for each p in P, compute min over a in A of || max(a - p, 0) ||
-      then average over p.
-    """
     if A_norm.size == 0 or P_norm.size == 0:
         return float("inf")
     dists = []
@@ -863,41 +1117,21 @@ def compute_gen_metrics_wrt_Pstar(history_fronts: List[Tuple[int, List[Tuple[flo
 
 
 # ========================
-# 7. NSGA-II core
+# 9. NSGA-II core
 # ========================
 
-def random_initial_individual(batches, path_lib, max_paths=3) -> Individual:
-    ind = Individual()
-    for batch in batches:
-        od = (batch.origin, batch.destination)
-        paths = path_lib.get(od, [])
-        if not paths:
-            continue
-
-        k = random.randint(1, min(max_paths, len(paths)))
-        chosen = random.sample(paths, k)
-        raw_allocs = [PathAllocation(path=p, share=random.random()) for p in chosen]
-
-        key = (batch.origin, batch.destination, batch.batch_id)
-        ind.od_allocations[key] = merge_and_normalize(raw_allocs)
-    return ind
-
-
 def dominates(a: Individual, b: Individual) -> bool:
-    # constraint-dominance
     if a.feasible and not b.feasible:
         return True
     if b.feasible and not a.feasible:
         return False
-
-    return all(x <= y for x, y in zip(a.objectives, b.objectives)) and \
-        any(x < y for x, y in zip(a.objectives, b.objectives))
+    return all(x <= y for x, y in zip(a.objectives, b.objectives)) and any(x < y for x, y in zip(a.objectives, b.objectives))
 
 
 def non_dominated_sort(pop: List[Individual]) -> List[List[Individual]]:
-    S: Dict[Individual, List[Individual]] = {p: [] for p in pop}
-    n: Dict[Individual, int] = {p: 0 for p in pop}
-    fronts: List[List[Individual]] = [[]]
+    S = {p: [] for p in pop}
+    n = {p: 0 for p in pop}
+    fronts = [[]]
 
     for p in pop:
         for q in pop:
@@ -912,41 +1146,37 @@ def non_dominated_sort(pop: List[Individual]) -> List[List[Individual]]:
 
     i = 0
     while i < len(fronts) and fronts[i]:
-        next_front: List[Individual] = []
+        nxt = []
         for p in fronts[i]:
             for q in S[p]:
                 n[q] -= 1
                 if n[q] == 0:
-                    next_front.append(q)
+                    nxt.append(q)
         i += 1
-        fronts.append(next_front)
+        fronts.append(nxt)
 
     return fronts[:-1]
 
 
 def crowding_distance(front: List[Individual]) -> Dict[Individual, float]:
     l = len(front)
-    d: Dict[Individual, float] = {ind: 0.0 for ind in front}
+    d = {ind: 0.0 for ind in front}
     if l == 0:
         return d
-
     m = len(front[0].objectives)
     for i in range(m):
         front.sort(key=lambda x: x.objectives[i])
-        d[front[0]] = float('inf')
-        d[front[-1]] = float('inf')
+        d[front[0]] = float("inf")
+        d[front[-1]] = float("inf")
         rng = front[-1].objectives[i] - front[0].objectives[i]
         if rng == 0:
             continue
         for j in range(1, l - 1):
-            d[front[j]] += (front[j + 1].objectives[i] -
-                            front[j - 1].objectives[i]) / rng
+            d[front[j]] += (front[j + 1].objectives[i] - front[j - 1].objectives[i]) / rng
     return d
 
 
-def tournament_select(pop: List[Individual],
-                      dists: Dict[Individual, float],
-                      ranks: Dict[Individual, int]) -> Individual:
+def tournament_select(pop: List[Individual], dists: Dict[Individual, float], ranks: Dict[Individual, int]) -> Individual:
     a, b = random.sample(pop, 2)
     if ranks[a] < ranks[b]:
         return a
@@ -957,37 +1187,44 @@ def tournament_select(pop: List[Individual],
     return b
 
 
-def run_nsga2_analytics(filename="data.xlsx",
-                        pop_size=60,
-                        generations=300,
-                        log_every=10):
-    """
-    Returns:
-      population, pareto_front, batches, history_fronts, stats,
-      plus (final_feasible_nd_objs, all_feasible_front0_objs_over_gens)
-    """
+def _count_infeas(pop: List[Individual]) -> Dict[str, int]:
+    agg = {"missing_alloc": 0, "late": 0, "arc_cap": 0, "node_cap": 0}
+    for ind in pop:
+        if ind.feasible:
+            continue
+        r = ind.infeas_reason or {}
+        for k in agg:
+            agg[k] += int(r.get(k, 0))
+    return agg
+
+
+def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_every=10):
     stats = RunStats()
     t_run0 = time.perf_counter()
 
     print("Loading data...")
-    node_names, arcs, timetables, batches = load_network_from_extended(filename)
+    node_names, node_caps, arcs, timetables, batches = load_network_from_extended(filename)
     tt_dict = build_timetable_dict(timetables)
-    path_lib = build_path_library(node_names, arcs, batches, timetables)
 
-    # init
+    # Use Time-Dependent Path Library Generation
+    path_lib = build_path_library(arcs, batches, tt_dict, K=100, repeats=40)
+
+    bad = report_time_feasible_coverage(batches, path_lib, tt_dict)
+
+    print("Initializing Population...")
     t_init0 = time.perf_counter()
-    population: List[Individual] = []
+    population = []
     for _ in range(pop_size):
-        ind = random_initial_individual(batches, path_lib)
-
+        ind = random_initial_individual(batches, path_lib, tt_dict)
         t0 = time.perf_counter()
-        evaluate_individual(ind, batches, path_lib, arcs, tt_dict)
+        evaluate_individual(ind, batches, arcs, tt_dict, node_caps)
         dt = time.perf_counter() - t0
         stats.evaluation_time += dt
         stats.evaluation_calls += 1
-
         population.append(ind)
     stats.init_time = time.perf_counter() - t_init0
+
+    print(f"[INIT] FeasiblePop={sum(1 for x in population if x.feasible)}/{len(population)} | infeas={_count_infeas(population)}")
 
     history_fronts: List[Tuple[int, List[Tuple[float, float, float]]]] = []
     all_feasible_front0_objs: List[Tuple[float, float, float]] = []
@@ -995,7 +1232,6 @@ def run_nsga2_analytics(filename="data.xlsx",
     for gen in range(generations):
         t_gen0 = time.perf_counter()
 
-        # NDSort
         t0 = time.perf_counter()
         fronts = non_dominated_sort(population)
         dt = time.perf_counter() - t0
@@ -1010,36 +1246,30 @@ def run_nsga2_analytics(filename="data.xlsx",
         current_front_objs = [ind.objectives for ind in front0_unique]
         history_fronts.append((gen, current_front_objs))
 
-        # collect feasible front0 objs for P*
         for ind in feasible_front0:
             all_feasible_front0_objs.append(ind.objectives)
 
-        feasible_pop = sum(1 for ind in population if ind.feasible)
-        if (gen % log_every == 0) or (gen == generations - 1):
-            print(f"Gen {gen}: Front0Unique={len(front0_unique)} | FeasiblePop={feasible_pop}/{len(population)}")
-
-        # ranks
-        ranks: Dict[Individual, int] = {}
+        ranks = {}
         for r, f in enumerate(fronts):
             for ind in f:
                 ranks[ind] = r
 
-        # crowding
         t0 = time.perf_counter()
-        dists: Dict[Individual, float] = {}
+        dists = {}
         for f in fronts:
             dists.update(crowding_distance(f))
         dt = time.perf_counter() - t0
         stats.crowd_time += dt
         stats.crowd_calls += 1
 
-        # selection
-        mating_pool: List[Individual] = []
-        while len(mating_pool) < pop_size:
-            mating_pool.append(tournament_select(population, dists, ranks))
+        if gen % log_every == 0 or gen == generations - 1:
+            print(f"Gen {gen}: Front0Unique={len(front0_unique)} | FeasiblePop={sum(1 for x in population if x.feasible)}/{len(population)}")
 
-        offspring: List[Individual] = []
+        mating = []
+        while len(mating) < pop_size:
+            mating.append(tournament_select(population, dists, ranks))
 
+        offspring = []
         gen_crossover_time = 0.0
         gen_mutation_time = 0.0
         gen_eval_time = 0.0
@@ -1048,25 +1278,19 @@ def run_nsga2_analytics(filename="data.xlsx",
         gen_mutation_calls = 0
 
         while len(offspring) < pop_size:
-            # crossover
             if random.random() < 0.7:
-                p1, p2 = random.sample(mating_pool, 2)
+                p1, p2 = random.sample(mating, 2)
                 t0 = time.perf_counter()
                 c1, c2 = crossover_structural(p1, p2, batches)
                 dt = time.perf_counter() - t0
-
                 stats.crossover_time += dt
                 stats.crossover_calls += 1
                 gen_crossover_time += dt
                 gen_crossover_calls += 1
-
-                if dt < stats.best_crossover_time:
-                    stats.best_crossover_time = dt
             else:
-                c1 = random_initial_individual(batches, path_lib)
-                c2 = random_initial_individual(batches, path_lib)
+                c1 = random_initial_individual(batches, path_lib, tt_dict)
+                c2 = random_initial_individual(batches, path_lib, tt_dict)
 
-            # mutation
             if random.random() < 0.3:
                 t0 = time.perf_counter()
                 mutate_structural(c1, batches, path_lib)
@@ -1085,52 +1309,50 @@ def run_nsga2_analytics(filename="data.xlsx",
                 gen_mutation_time += dt
                 gen_mutation_calls += 1
 
-            # evaluation (time each call)
-            t0 = time.perf_counter()
-            evaluate_individual(c1, batches, path_lib, arcs, tt_dict)
-            dt1 = time.perf_counter() - t0
-            stats.evaluation_time += dt1
-            stats.evaluation_calls += 1
-            gen_eval_time += dt1
-            gen_eval_calls += 1
-            if dt1 > stats.best_crossover_time:
-                stats.eval_slower_than_best_crossover += 1
+            repair_individual(c1, batches, path_lib, tt_dict)
+            repair_individual(c2, batches, path_lib, tt_dict)
 
             t0 = time.perf_counter()
-            evaluate_individual(c2, batches, path_lib, arcs, tt_dict)
-            dt2 = time.perf_counter() - t0
-            stats.evaluation_time += dt2
+            evaluate_individual(c1, batches, arcs, tt_dict, node_caps)
+            dt = time.perf_counter() - t0
+            stats.evaluation_time += dt
             stats.evaluation_calls += 1
-            gen_eval_time += dt2
+            gen_eval_time += dt
             gen_eval_calls += 1
-            if dt2 > stats.best_crossover_time:
-                stats.eval_slower_than_best_crossover += 1
+
+            t0 = time.perf_counter()
+            evaluate_individual(c2, batches, arcs, tt_dict, node_caps)
+            dt = time.perf_counter() - t0
+            stats.evaluation_time += dt
+            stats.evaluation_calls += 1
+            gen_eval_time += dt
+            gen_eval_calls += 1
 
             offspring.append(c1)
             offspring.append(c2)
 
-        # environmental selection
         combined = population + offspring
-
+        
         t0 = time.perf_counter()
         fronts2 = non_dominated_sort(combined)
         dt = time.perf_counter() - t0
         stats.ndsort_time += dt
         stats.ndsort_calls += 1
 
-        new_pop: List[Individual] = []
+        new_pop = []
         for f in fronts2:
             if len(new_pop) + len(f) <= pop_size:
                 new_pop.extend(f)
             else:
                 t0 = time.perf_counter()
-                d = crowding_distance(f)
+                cd = crowding_distance(f)
                 dt = time.perf_counter() - t0
                 stats.crowd_time += dt
                 stats.crowd_calls += 1
-                f.sort(key=lambda x: d[x], reverse=True)
+                f.sort(key=lambda x: cd[x], reverse=True)
                 new_pop.extend(f[:pop_size - len(new_pop)])
                 break
+
         population = new_pop
 
         gen_total = time.perf_counter() - t_gen0
@@ -1147,21 +1369,18 @@ def run_nsga2_analytics(filename="data.xlsx",
             "gen_mutation_calls": int(gen_mutation_calls),
         })
 
-    # final pareto (prefer feasible)
     final_fronts = non_dominated_sort(population)
     front0 = final_fronts[0]
     feasible_front0 = [ind for ind in front0 if ind.feasible]
     base_front = feasible_front0 if feasible_front0 else front0
     pareto_front = unique_individuals_by_objectives(base_front, tol=1e-3)
 
-    # collect final feasible ND objs for P*
     final_feasible = [ind for ind in pareto_front if ind.feasible]
     final_feasible_nd_objs = [ind.objectives for ind in (final_feasible if final_feasible else pareto_front)]
     final_feasible_nd_objs = pareto_filter_objectives(final_feasible_nd_objs, tol=1e-6)
 
     stats.run_total_time = time.perf_counter() - t_run0
 
-    # print timing summary for this run
     print("\n========== TIMING SUMMARY (this run) ==========")
     s = stats.summary_dict()
     for k, v in s.items():
@@ -1173,12 +1392,10 @@ def run_nsga2_analytics(filename="data.xlsx",
 
 
 # ========================
-# 8. Output & plots
+# 10. Output & plots
 # ========================
 
-def save_pareto_solutions(pareto: List[Individual],
-                          batches: List[Batch],
-                          filename: str = "result.txt"):
+def save_pareto_solutions(pareto: List[Individual], batches: List[Batch], filename: str = "result.txt"):
     pareto = unique_individuals_by_objectives(pareto, tol=1e-3)
     with open(filename, "w", encoding="utf-8") as f:
         f.write("===== NSGA-II Pareto Solutions (Unique, Feasible-first) =====\n\n")
@@ -1187,11 +1404,11 @@ def save_pareto_solutions(pareto: List[Individual],
             f.write(f"===== Solution {i} =====\n")
             f.write(f"Objectives: Cost={cost:.6f}, Emission={emit:.6f}, Time={time_:.6f}, Penalty={ind.penalty:.6f}\n")
             f.write(f"Feasible={ind.feasible}\n\n")
-            for batch in batches:
-                key = (batch.origin, batch.destination, batch.batch_id)
+            for b in batches:
+                key = (b.origin, b.destination, b.batch_id)
                 allocs = ind.od_allocations.get(key, [])
                 if allocs:
-                    f.write(f"Batch {batch.batch_id}: {batch.origin}->{batch.destination} Q={batch.quantity}\n")
+                    f.write(f"Batch {b.batch_id}: {b.origin}->{b.destination} Q={b.quantity}\n")
                     for a in allocs:
                         f.write(str(a) + "\n")
                 f.write("\n")
@@ -1229,31 +1446,18 @@ def plot_pareto_evolution_3d(history_fronts):
     print("[Saved] pareto_evolution_3d.png")
 
 
-# ========================
-# 8.1 NEW: line plots (NO shadow) for HV/IGD+/SP
-# ========================
-
 def _sanitize_series(y: List[float], fallback: float = 0.0) -> np.ndarray:
-    """
-    Make a series plottable:
-    - convert inf/nan -> nan
-    - forward-fill nan
-    - back-fill leading nan
-    - if all nan -> fallback
-    """
     arr = np.array(y, dtype=float)
     arr[~np.isfinite(arr)] = np.nan
 
     if np.all(np.isnan(arr)):
         return np.full_like(arr, fallback, dtype=float)
 
-    # forward fill
     for i in range(len(arr)):
         if np.isnan(arr[i]):
             if i > 0:
                 arr[i] = arr[i - 1]
 
-    # back fill leading nan (if first entries were nan)
     if np.isnan(arr[0]):
         first_valid = None
         for i in range(len(arr)):
@@ -1264,20 +1468,17 @@ def _sanitize_series(y: List[float], fallback: float = 0.0) -> np.ndarray:
             return np.full_like(arr, fallback, dtype=float)
         arr[:first_valid] = arr[first_valid]
 
-    # final cleanup
     arr = np.nan_to_num(arr, nan=fallback, posinf=fallback, neginf=fallback)
     return arr
 
 
-def plot_single_run_line(series: List[float], title: str, ylabel: str, filename: str,
-                         marker_every: int = 1):
+def plot_single_run_line(series: List[float], title: str, ylabel: str, filename: str, marker_every: int = 1):
     y = _sanitize_series(series, fallback=0.0)
     gens = np.arange(len(y))
 
-    # 自动减少点的密度，避免太密
     if marker_every <= 0:
         marker_every = 1
-    auto_me = max(1, len(gens) // 50)  # 大约最多 50 个marker
+    auto_me = max(1, len(gens) // 50)
     me = max(marker_every, auto_me)
 
     plt.figure(figsize=(8, 5))
@@ -1292,12 +1493,7 @@ def plot_single_run_line(series: List[float], title: str, ylabel: str, filename:
     print(f"[Saved] {filename}")
 
 
-def plot_mean_convergence_line(all_run_metrics: List[List[float]],
-                               title: str, ylabel: str, filename: str):
-    """
-    all_run_metrics: list of runs, each is a list over gens.
-    Produces mean line (with markers), NO shadow.
-    """
+def plot_mean_convergence_line(all_run_metrics: List[List[float]], title: str, ylabel: str, filename: str):
     if not all_run_metrics:
         print(f"[WARN] Empty metrics for {title}, skip.")
         return
@@ -1306,11 +1502,11 @@ def plot_mean_convergence_line(all_run_metrics: List[List[float]],
     for run in all_run_metrics:
         clean_runs.append(_sanitize_series(run, fallback=0.0))
 
-    data = np.vstack(clean_runs)  # (runs, gens)
+    data = np.vstack(clean_runs)
     mean_curve = np.mean(data, axis=0)
     gens = np.arange(len(mean_curve))
 
-    me = max(1, len(gens) // 50)  # ~50 markers
+    me = max(1, len(gens) // 50)
     plt.figure(figsize=(8, 5))
     plt.plot(gens, mean_curve, linewidth=2, marker='o', markevery=me, label='Mean')
     plt.xlabel("Generation")
@@ -1324,25 +1520,16 @@ def plot_mean_convergence_line(all_run_metrics: List[List[float]],
     print(f"[Saved] {filename}")
 
 
-# ========================
-# 9. Main: multi-run experiment with P* and metrics
-# ========================
-
 if __name__ == "__main__":
     filename = "data.xlsx"
     pop_size = 60
-    generations = 400
+    generations = 200  # Restored to 200 as per previous good runs
     runs = 30
 
     print(f"\nStarting Experiment: Runs={runs}, Gen={generations}, Pop={pop_size}\n")
 
-    # Cache runs
     cache_runs = []
-
-    # For building global P*
     all_objs_for_Pstar: List[Tuple[float, float, float]] = []
-
-    # Timing summaries across runs
     all_run_summaries: List[Dict] = []
 
     t_all0 = time.perf_counter()
@@ -1361,11 +1548,9 @@ if __name__ == "__main__":
             log_every=10
         )
 
-        # Build P* candidates:
         all_objs_for_Pstar.extend(final_feas_nd)
         all_objs_for_Pstar.extend(pareto_filter_objectives(feas_front0_allgens, tol=1e-6))
 
-        # Store run artifacts
         cache_runs.append({
             "run_id": run_id,
             "seed": seed,
@@ -1376,7 +1561,6 @@ if __name__ == "__main__":
             "stats": stats
         })
 
-        # Per-run summary
         run_summary = stats.summary_dict()
         run_summary["run_id"] = run_id
         run_summary["seed"] = seed
@@ -1392,11 +1576,9 @@ if __name__ == "__main__":
               f"Time total={stats.run_total_time:.2f}s | "
               f"eval={stats.evaluation_time:.2f}s | cross={stats.crossover_time:.2f}s")
 
-    # Build global P*
     Pstar = build_reference_front_Pstar(all_objs_for_Pstar)
     print(f"\n[Global P*] Size: {len(Pstar)}")
 
-    # Compute per-generation metrics for each run w.r.t. P*
     all_runs_igds = []
     all_runs_sps = []
     all_runs_hvs = []
@@ -1409,20 +1591,15 @@ if __name__ == "__main__":
         all_runs_sps.append(sps)
         all_runs_hvs.append(hvs)
 
-        # attach final metrics for best-run selection
         item["final_igd_plus"] = float(igds[-1]) if igds else float("inf")
         item["final_spacing"] = float(sps[-1]) if sps else float("inf")
         item["final_hv_norm"] = float(hvs[-1]) if hvs else 0.0
 
-    # Select best run by FINAL HV_norm
     best_item = max(cache_runs, key=lambda x: x.get("final_hv_norm", 0.0))
     best_run_idx = best_item["run_id"]
     print(f"\n[Best Run Selection] by final HV_norm: Run={best_run_idx}, HV_norm={best_item['final_hv_norm']:.4f}, "
           f"IGD+={best_item['final_igd_plus']:.4f}, SP={best_item['final_spacing']:.4f}")
 
-    # =========================
-    # NEW: mean line plots (折线图, 带点) across 30 runs
-    # =========================
     plot_mean_convergence_line(
         all_runs_hvs,
         title=f"HV_norm (Mean over {runs} runs)",
@@ -1442,9 +1619,6 @@ if __name__ == "__main__":
         filename="spacing_mean_line.png"
     )
 
-    # =========================
-    # NEW: best-run line plots (折线图, 带点)
-    # =========================
     best_h_fronts = best_item["history_fronts"]
     _, best_igds, best_sps, best_hvs = compute_gen_metrics_wrt_Pstar(best_h_fronts, Pstar, hv_norm_samples=20000)
 
@@ -1467,14 +1641,12 @@ if __name__ == "__main__":
         filename="best_spacing_line.png"
     )
 
-    # Best run visualisations and outputs
     best_pareto = best_item["pareto"]
     best_batches = best_item["batches"]
 
     plot_pareto_evolution_3d(best_h_fronts)
     save_pareto_solutions(best_pareto, best_batches, filename="result.txt")
 
-    # Save timing summary CSV
     df_sum = pd.DataFrame(all_run_summaries)
     df_sum.to_csv("timing_summary_runs.csv", index=False)
     print("[Saved] timing_summary_runs.csv")
