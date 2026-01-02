@@ -1,13 +1,44 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+"""
+NSGA-II for multimodal routing with:
+- Batch-level chromosome key = (origin, destination, batch_id)
+- Time-dependent timetable waiting (rail/water)
+- Node capacity queueing (service rate)
+- Arc capacity queueing (service rate)
+- Border/customs delay at border nodes
+- Transshipment (mode change) cost & time at intermediate nodes
+- Regional carbon policy heterogeneity:
+    - emission factor by (region_group, mode)
+    - carbon tax by region_group
+    - applicability theta by (region_group, mode)
+
+NEW (for your request):
+(2) Waiting-related emissions added into objective f2:
+    - timetable wait, arc wait, node wait, border time, transshipment time
+    - arc service time, node service time (processing)
+    - controlled by Waiting_Costs sheet column:
+        WaitEmission_gCO2_per_TEU_h (or aliases)
+(5) Roulette mutation behaviour tracking + plots:
+    - per generation attempt/exec counts, shares, success rates
+    - output CSV + stacked share plots + success-rate plots
+
+NEW (this turn):
+(6) Single waiting episode at a node > 48h => HARD infeasible (wait48)
+    - checks applied to: timetable_wait, arc_wait, border_time, node_wait
+    - recorded in ind.infeas_reason["wait48"] and ind.debug_info["batch_wait48_first"]
+    - post-eval hard repair (only when wait48 triggered) to avoid the violated node if possible
+
+Data file: data.xlsx
+"""
+
 import math
 import random
 import time
 import heapq
-from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, DefaultDict
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 import numpy as np
@@ -25,11 +56,13 @@ CHINA_REGIONS = {"CN", "China"}
 EUROPE_REGIONS = {"WE", "EE", "EU", "Europe"}
 BIG_M = 1e6
 
-# 排队/拥堵成本系数
-WAITING_COST_PER_TEU_HOUR = 0.5 
-
 # timetable safety
 HEADWAY_CAP_H = 48.0
+
+# NEW: single waiting episode hard cap (per node)
+WAIT_EVENT_CAP_H = 48.0
+WAIT48_HARD_PENALTY = 1e9
+WAIT48_EPS = 1e-9
 
 # mutation roulette weights
 W_ADD = 0.25
@@ -50,7 +83,7 @@ class Arc:
     distance: float
     capacity: float       # TEU / time-bucket
     cost_per_teu_km: float
-    emission_per_teu_km: float
+    emission_per_teu_km: float  # legacy field; evaluation uses regional emission factors
     speed_kmh: float
 
 
@@ -116,6 +149,7 @@ class Individual:
     penalty: float = 0.0
     feasible: bool = False
     infeas_reason: Dict[str, int] = field(default_factory=dict)
+    debug_info: Dict = field(default_factory=dict)
 
 
 # ========================
@@ -154,7 +188,7 @@ def clone_gene(a: PathAllocation) -> PathAllocation:
 
 
 # ========================
-# 3. Load data
+# 3. Load data + parameters
 # ========================
 
 def _detect_node_capacity_columns(nodes_df: pd.DataFrame) -> List[str]:
@@ -175,20 +209,58 @@ def _pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Opti
     return None
 
 
+def _parse_float(x) -> float:
+    if pd.isna(x):
+        return float("nan")
+    s = str(x)
+    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch == "." or ch == "-"))
+    if cleaned in ("", "-", "."):
+        return float("nan")
+    try:
+        return float(cleaned)
+    except Exception:
+        return float("nan")
+
+
 def load_network_from_extended(filename: str):
     try:
         xls = pd.ExcelFile(filename)
     except FileNotFoundError:
         raise FileNotFoundError(f"File '{filename}' not found.")
-        
+
     DAILY_HOURS = 24.0
 
-    # Nodes
+    # ---- Base sheets
     nodes_df = pd.read_excel(xls, "Nodes")
-    # node_names for random DFS compatibility (if needed) but we use Dijkstra
-    node_names = nodes_df["EnglishName"].astype(str).tolist()
-    node_region = dict(zip(nodes_df["EnglishName"].astype(str), nodes_df["Region"].astype(str)))
+    arcs_df = pd.read_excel(xls, "Arcs_All")
+    tdf = pd.read_excel(xls, "Timetable")
+    bdf = pd.read_excel(xls, "Batches")
 
+    # ---- Parameter sheets
+    region_map_df = pd.read_excel(xls, "Region_Map")
+    carbon_tax_df = pd.read_excel(xls, "Carbon_Tax")
+    carbon_app_df = pd.read_excel(xls, "Carbon_Applicability")
+    emis_df = pd.read_excel(xls, "Emission_Factors")
+    mode_speed_df = pd.read_excel(xls, "Mode_Speeds")
+    node_border_df = pd.read_excel(xls, "Node_Border")
+    transship_df = pd.read_excel(xls, "Transshipment")
+    waiting_df = pd.read_excel(xls, "Waiting_Costs")
+
+    # Nodes
+    node_names = nodes_df["EnglishName"].astype(str).tolist()
+    node_region_code = dict(zip(nodes_df["EnglishName"].astype(str), nodes_df["Region"].astype(str)))
+
+    # region code -> region group
+    rc2g = dict(zip(region_map_df["RegionCode_in_Nodes"].astype(str),
+                    region_map_df["RegionGroup"].astype(str)))
+
+    def to_group(rc: str) -> str:
+        rc = str(rc).strip()
+        return rc2g.get(rc, rc)
+
+    region_group_of_node = {n: to_group(r) for n, r in node_region_code.items()}
+
+    # Node capacities -> TEU / time-bucket
     cap_cols = _detect_node_capacity_columns(nodes_df)
     node_caps: Dict[str, float] = {}
     for _, row in nodes_df.iterrows():
@@ -207,29 +279,95 @@ def load_network_from_extended(filename: str):
         if cap_val is None:
             node_caps[n] = 1e18
         else:
+            # Heuristic: TEU/h or TEU/day
             if used and ("teuh" in used or "hour" in used):
                 node_caps[n] = cap_val * TIME_BUCKET_H
             else:
                 node_caps[n] = cap_val * (TIME_BUCKET_H / DAILY_HOURS)
-            
+
             if node_caps[n] <= 1e-6:
                 node_caps[n] = 1e-6
 
-    # Arcs
-    arcs_df = pd.read_excel(xls, "Arcs_All")
+    # Carbon tax (USD / tonCO2)
+    carbon_tax_usd = dict(zip(carbon_tax_df["RegionGroup"].astype(str),
+                              carbon_tax_df["CT_USD_per_tonCO2"].astype(float)))
 
+    # Applicability theta(region, mode)
+    theta: Dict[Tuple[str, str], int] = {}
+    for _, row in carbon_app_df.iterrows():
+        theta[(str(row["RegionGroup"]), str(row["Mode"]).lower())] = int(row["Theta"])
+
+    # Emission factors (gCO2 / TEU-km)
+    emis_factor_g_teu_km: Dict[Tuple[str, str], float] = {}
+    for _, row in emis_df.iterrows():
+        rg = str(row["RegionGroup"])
+        m = str(row["Mode"]).lower()
+        emis_factor_g_teu_km[(rg, m)] = float(row["gCO2_per_TEU_km_assuming10t"])
+
+    # Mode speeds (km/h)
+    mode_speed = dict(zip(mode_speed_df["Mode"].astype(str).str.lower(),
+                          mode_speed_df["Speed_kmh"].astype(float)))
+
+    # Transshipment (node, from_mode, to_mode) -> (cost, time)
+    transship: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+    for _, row in transship_df.iterrows():
+        key = (str(row["Node"]), str(row["FromMode"]).lower(), str(row["ToMode"]).lower())
+        transship[key] = (float(row["TransferCost_USD_per_TEU"]), float(row["TransferTime_h"]))
+
+    # Border info per node
+    node_border: Dict[str, Dict[str, float]] = {}
+    for _, row in node_border_df.iterrows():
+        n = str(row["EnglishName"])
+        node_border[n] = {
+            "is_border": int(row["IsBorderNode"]),
+            "customs_h": float(row["CustomsClearance_h"]),
+            "bd_road_h": float(row["BorderDelay_road_h"]),
+            "bd_rail_h": float(row["BorderDelay_rail_h"]),
+            "bd_water_h": float(row["BorderDelay_water_h"]),
+            "border_cap_day": float(row.get("BorderCapacity_TEUday", 0.0)),
+        }
+
+    # Waiting cost parameters + waiting/processing emission factor (gCO2 / TEU-hour)
+    wait_emis_col = _pick_first_existing_column(
+        waiting_df,
+        ["WaitEmission_gCO2_per_TEU_h", "E_wait_gCO2_per_TEU_h", "WaitingEmission_gCO2_per_TEU_h"]
+    )
+    wait_emis_g_per_teu_h = None
+    try:
+        if wait_emis_col is not None and pd.notna(waiting_df.loc[0, wait_emis_col]):
+            wait_emis_g_per_teu_h = float(waiting_df.loc[0, wait_emis_col])
+    except Exception:
+        wait_emis_g_per_teu_h = None
+
+    if wait_emis_g_per_teu_h is None:
+        wait_emis_g_per_teu_h = 0.0
+        print("[INFO] Waiting_Costs: no wait-emission column found. "
+              "Using default WAIT_EMISSION_gCO2_per_TEU_h = 0.0. "
+              "Add column 'WaitEmission_gCO2_per_TEU_h' to enable waiting-emission modelling.")
+
+    waiting_cost = {
+        "hold": float(waiting_df.loc[0, "W_hold_USD_per_TEU_h"]),
+        "proc": float(waiting_df.loc[0, "W_proc_USD_per_TEU_h"]),
+        "cong": float(waiting_df.loc[0, "W_cong_USD_per_TEU_h"]),
+        "emis_g_per_teu_h": float(wait_emis_g_per_teu_h),
+    }
+
+    # Arcs
     speed_col = _pick_first_existing_column(arcs_df, ["Speed_kmh", "SpeedKMH", "AvgSpeed_kmh", "Speed"])
     time_col  = _pick_first_existing_column(arcs_df, ["TravelTime_h", "Time_h", "TransitTime_h", "Duration_h", "TimeHours"])
+    cap_h_col = _pick_first_existing_column(arcs_df, ["Capacity_TEUh", "Cap_TEUh"])
+    cap_day_col = _pick_first_existing_column(arcs_df, ["Capacity_TEUday", "Cap_TEUday", "Capacity_TEU"])
 
     arcs: List[Arc] = []
     for _, row in arcs_df.iterrows():
         mode_raw = str(row["Mode"]).strip().lower()
         mode = "rail" if mode_raw == "rail" else mode_raw
 
-        dist_str = str(row["Distance_km"])
-        cleaned = "".join(ch for ch in dist_str if (ch.isdigit() or ch == "."))
-        distance = float(cleaned) if cleaned else 0.0
+        distance = _parse_float(row.get("Distance_km", 0.0))
+        if not np.isfinite(distance):
+            distance = 0.0
 
+        # speed
         speed = None
         if speed_col is not None and pd.notna(row.get(speed_col, np.nan)):
             try:
@@ -246,27 +384,33 @@ def load_network_from_extended(filename: str):
                 speed = None
 
         if speed is None:
-            speed = 75.0 if mode == "road" else (30.0 if mode == "water" else 50.0)
+            speed = float(mode_speed.get(mode, 50.0))
 
-        if "Capacity_TEU" in arcs_df.columns and not pd.isna(row.get("Capacity_TEU", np.nan)):
-            raw_cap = float(row["Capacity_TEU"])
-        else:
-            raw_cap = 1e18
-        capacity = raw_cap * (TIME_BUCKET_H / DAILY_HOURS)
+        # capacity
+        capacity = 1e18
+        try:
+            if cap_h_col is not None and pd.notna(row.get(cap_h_col, np.nan)):
+                capacity = float(row[cap_h_col]) * TIME_BUCKET_H
+            elif cap_day_col is not None and pd.notna(row.get(cap_day_col, np.nan)):
+                cap_day = float(row[cap_day_col])
+                capacity = cap_day * (TIME_BUCKET_H / DAILY_HOURS)
+        except Exception:
+            capacity = 1e18
+        if capacity <= 1e-9:
+            capacity = 1e-9
 
         arcs.append(Arc(
             from_node=str(row["OriginEN"]).strip(),
             to_node=str(row["DestEN"]).strip(),
             mode=mode,
-            distance=distance,
-            capacity=capacity,
+            distance=float(distance),
+            capacity=float(capacity),
             cost_per_teu_km=float(row["Cost_$_per_km"]),
             emission_per_teu_km=float(row["Emission_gCO2_per_tkm"]),
             speed_kmh=float(max(speed, 1.0)),
         ))
 
     # Timetable
-    tdf = pd.read_excel(xls, "Timetable")
     timetables: List[TimetableEntry] = []
     for _, row in tdf.iterrows():
         freq = float(row["Frequency_per_week"])
@@ -294,8 +438,7 @@ def load_network_from_extended(filename: str):
             headway_hours=float(hd)
         ))
 
-    # Batches
-    bdf = pd.read_excel(xls, "Batches")
+    # Batches (ET/LT auto unit)
     lt_vals = []
     for v in bdf["LT"].values.tolist():
         try:
@@ -317,8 +460,8 @@ def load_network_from_extended(filename: str):
     for _, row in bdf.iterrows():
         origin = str(row["OriginEN"]).strip()
         dest = str(row["DestEN"]).strip()
-        o_reg = node_region.get(origin)
-        d_reg = node_region.get(dest)
+        o_reg = node_region_code.get(origin)
+        d_reg = node_region_code.get(dest)
         if o_reg in CHINA_REGIONS and d_reg in EUROPE_REGIONS:
             ET_raw = float(row["ET"])
             LT_raw = float(row["LT"])
@@ -334,7 +477,12 @@ def load_network_from_extended(filename: str):
             ))
 
     print(f"[INFO] Number of batches loaded: {len(batches)}")
-    return node_names, node_caps, arcs, timetables, batches
+
+    return (
+        node_names, node_caps, arcs, timetables, batches,
+        region_group_of_node, carbon_tax_usd, theta,
+        emis_factor_g_teu_km, transship, node_border, waiting_cost
+    )
 
 
 # ========================
@@ -371,28 +519,59 @@ def next_departure_time(current_t: float, entries: List[TimetableEntry]) -> floa
     return best
 
 
-def simulate_time_only(path: Path, ET: float, tt_dict) -> float:
+def simulate_time_only(path: Path, ET: float, tt_dict,
+                       transship: Dict[Tuple[str, str, str], Tuple[float, float]],
+                       node_border: Dict[str, Dict[str, float]]) -> float:
+    """
+    Time-only simulation used for repair feasibility screening:
+    - timetable waiting
+    - transfer time on mode changes
+    - border/customs time at arrival nodes
+    (No queueing due to capacities; the queueing is handled only in evaluation.)
+    """
     t = ET
+    prev_mode = None
+
     for arc in path.arcs:
+        # transshipment at arc.from_node if mode changes
+        if prev_mode is not None and arc.mode != prev_mode:
+            node_j = arc.from_node
+            _, tt_h = transship.get((node_j, prev_mode, arc.mode), (150.0, 3.0))
+            t += float(tt_h)
+        prev_mode = arc.mode
+
         travel = arc.distance / max(arc.speed_kmh, 1.0)
         if arc.mode == "road":
             dep = t
         else:
             dep = next_departure_time(t, tt_dict.get((arc.from_node, arc.to_node, arc.mode), []))
         t = dep + travel
+
+        # border/customs at arrival node
+        info = node_border.get(arc.to_node)
+        if info and int(info.get("is_border", 0)) == 1:
+            cc = float(info.get("customs_h", 0.0))
+            if arc.mode == "road":
+                bd = float(info.get("bd_road_h", 0.0))
+            elif arc.mode == "rail":
+                bd = float(info.get("bd_rail_h", 0.0))
+            else:
+                bd = float(info.get("bd_water_h", 0.0))
+            t += (cc + bd)
+
     return t - ET
 
 
 def dijkstra_time_dependent(graph: Dict[str, List[Arc]], origin: str, dest: str,
-                            start_time: float, tt_dict,
-                            mode_weights: Optional[Dict[str, float]] = None,
-                            max_hops: int = 50) -> Optional[List[Arc]]:
+                           start_time: float, tt_dict,
+                           mode_weights: Optional[Dict[str, float]] = None,
+                           max_hops: int = 50) -> Optional[List[Arc]]:
     pq = []
     heapq.heappush(pq, (start_time, start_time, origin, 0))
 
     min_arrival = {origin: start_time}
     prev: Dict[str, Tuple[str, Arc]] = {}
-    
+
     if mode_weights is None:
         mode_weights = {}
 
@@ -420,19 +599,18 @@ def dijkstra_time_dependent(graph: Dict[str, List[Arc]], origin: str, dest: str,
                 dep_time = raw_dep
 
             travel_time = arc.distance / max(arc.speed_kmh, 1.0)
-            
+
             mw = mode_weights.get(arc.mode, 1.0)
             perceived_travel = travel_time * mw
-                
+
             real_arrival_time = dep_time + travel_time
-            
-            priority_metric = dep_time + perceived_travel 
+
+            priority_metric = dep_time + perceived_travel
             priority_metric *= (1.0 + random.uniform(-0.02, 0.02))
 
             if real_arrival_time < min_arrival.get(v, float("inf")):
                 min_arrival[v] = real_arrival_time
                 prev[v] = (u, arc)
-                
                 heapq.heappush(pq, (priority_metric, real_arrival_time, v, hops + 1))
 
     if dest not in prev:
@@ -455,46 +633,43 @@ def build_path_library(arcs: List[Arc], batches: List[Batch], tt_dict,
     graph = build_graph(arcs)
     lib: Dict[Tuple[str, str], List[Path]] = {}
     pid = 0
-    
+
     print(f"[INFO] Building Diverse Time-Dependent Path Library for {len(batches)} batches...", flush=True)
-    
     count_new = 0
 
     for i, b in enumerate(batches):
         od = (b.origin, b.destination)
         if od not in lib:
             lib[od] = []
-            
-        existing_signatures = set()
-        for p in lib[od]:
-            existing_signatures.add((tuple(p.nodes), tuple(p.modes)))
+
+        existing_signatures = set((tuple(p.nodes), tuple(p.modes)) for p in lib[od])
 
         found_seqs = []
-        
+
         base = dijkstra_time_dependent(graph, b.origin, b.destination, b.ET, tt_dict, mode_weights=None)
         if base:
             found_seqs.append(base)
-            
+
         for _ in range(repeats):
             mw = {
-                "road": random.choice([1.0, 1.0, 3.0, 5.0, 10.0]), 
+                "road": random.choice([1.0, 1.0, 3.0, 5.0, 10.0]),
                 "rail": random.choice([1.0, 1.0, 2.0, 5.0]),
                 "water": random.choice([0.5, 0.8, 1.0, 2.0])
             }
             seq = dijkstra_time_dependent(graph, b.origin, b.destination, b.ET, tt_dict, mode_weights=mw)
             if seq:
                 found_seqs.append(seq)
-                
+
         for seq in found_seqs:
             nodes = [seq[0].from_node] + [a.to_node for a in seq]
             modes = [a.mode for a in seq]
             sig = (tuple(nodes), tuple(modes))
-            
+
             if sig not in existing_signatures:
                 cost = sum(a.cost_per_teu_km * a.distance for a in seq)
                 emis = sum(a.emission_per_teu_km * a.distance for a in seq)
                 tt_base = sum(a.distance / max(a.speed_kmh, 1.0) for a in seq)
-                
+
                 new_p = Path(
                     path_id=pid,
                     origin=b.origin,
@@ -510,9 +685,9 @@ def build_path_library(arcs: List[Arc], batches: List[Batch], tt_dict,
                 lib[od].append(new_p)
                 existing_signatures.add(sig)
                 count_new += 1
-                
+
         if len(lib[od]) > K * 2:
-             lib[od] = lib[od][:K*2]
+            lib[od] = lib[od][:K * 2]
 
         if (i + 1) % 1 == 0:
             print(f"  Processed {i+1}/{len(batches)} batches... (Found {count_new} paths so far)", flush=True)
@@ -521,7 +696,7 @@ def build_path_library(arcs: List[Arc], batches: List[Batch], tt_dict,
     return lib
 
 
-def report_time_feasible_coverage(batches, path_lib, tt_dict):
+def report_time_feasible_coverage(batches, path_lib, tt_dict, transship, node_border):
     bad = []
     print("\n[TIME FEASIBILITY CHECK] per-batch coverage:")
     for b in batches:
@@ -535,7 +710,7 @@ def report_time_feasible_coverage(batches, path_lib, tt_dict):
         feas_cnt = 0
         best_arr = float("inf")
         for p in paths:
-            arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+            arr = b.ET + simulate_time_only(p, b.ET, tt_dict, transship, node_border)
             best_arr = min(best_arr, arr)
             if arr <= b.LT + 1e-9:
                 feas_cnt += 1
@@ -544,43 +719,79 @@ def report_time_feasible_coverage(batches, path_lib, tt_dict):
         if feas_cnt == 0:
             print(f"  Batch {b.batch_id}: feas_paths={feas_cnt}/{len(paths)} | ET={b.ET:.1f}, LT={b.LT:.1f}, best_arr={best_arr:.1f} -> {status}")
             bad.append((b.batch_id, b.origin, b.destination, b.ET, b.LT, best_arr))
-    
+
     if bad:
-        print(f"\n[WARNING] {len(bad)} batches have ZERO time-feasible paths.")
+        print(f"\n[WARNING] {len(bad)} batches have ZERO time-feasible paths (ignoring capacity queueing).")
     else:
-        print("\n[SUCCESS] All batches have at least one time-feasible path.")
+        print("\n[SUCCESS] All batches have at least one time-feasible path (ignoring capacity queueing).")
     print()
     return bad
 
 
 # ========================
-# 6. Evaluation with Queueing (Congestion -> Delay -> Cost/Lateness)
+# 6. Evaluation (Queueing + Carbon + Border + Transshipment + ArcCap)
 # ========================
 
-def evaluate_individual(ind: Individual, batches: List[Batch], arcs: List[Arc], tt_dict, node_caps: Dict[str, float]):
+def evaluate_individual(ind: Individual,
+                        batches: List[Batch],
+                        tt_dict,
+                        node_caps: Dict[str, float],
+                        region_group_of_node: Dict[str, str],
+                        carbon_tax_usd: Dict[str, float],
+                        theta: Dict[Tuple[str, str], int],
+                        emis_factor_g_teu_km: Dict[Tuple[str, str], float],
+                        transship: Dict[Tuple[str, str, str], Tuple[float, float]],
+                        node_border: Dict[str, Dict[str, float]],
+                        waiting_cost: Dict[str, float]):
+
     total_cost = 0.0
-    total_emis = 0.0
+    total_emis_g = 0.0
     makespan = 0.0
 
     penalty = 0.0
     missing = False
     late = False
 
+    # NEW: wait48 tracking (single waiting episode hard cap)
+    wait48_any = False
+    batch_wait48 = defaultdict(int)     # bid -> 0/1
+    batch_wait48_first = {}             # bid -> first violation record
+
+    def _flag_wait48(bid: int, where: str, node: str, wait_h: float, arc: Optional[Arc] = None) -> bool:
+        nonlocal wait48_any, penalty
+        if wait_h > WAIT_EVENT_CAP_H + WAIT48_EPS:
+            wait48_any = True
+            batch_wait48[bid] = 1
+            if bid not in batch_wait48_first:
+                batch_wait48_first[bid] = {
+                    "where": where,
+                    "node": str(node),
+                    "wait_h": float(wait_h),
+                    "from_node": (arc.from_node if arc else None),
+                    "to_node": (arc.to_node if arc else None),
+                    "mode": (arc.mode if arc else None),
+                }
+            penalty += WAIT48_HARD_PENALTY
+            return True
+        return False
+
+    # waiting/processing emission factor (gCO2 per TEU-hour)
+    wait_emis_g_per_teu_h = float(waiting_cost.get("emis_g_per_teu_h", 0.0))
+
+    # Build tasks
     tasks = []
-    
     for b in batches:
         key = (b.origin, b.destination, b.batch_id)
         allocs = ind.od_allocations.get(key, [])
-        
         if not allocs:
             penalty += 1e9
             missing = True
             continue
-            
+
         for a in allocs:
             if a.share <= 1e-12:
                 continue
-            qty = a.share * b.quantity
+            qty = a.share * b.quantity  # TEU
             tasks.append({
                 "start_time": b.ET,
                 "quantity": qty,
@@ -590,75 +801,161 @@ def evaluate_individual(ind: Individual, batches: List[Batch], arcs: List[Arc], 
 
     tasks.sort(key=lambda x: x["start_time"])
 
+    # Queue states
     node_next_free_time: Dict[str, float] = defaultdict(float)
+    arc_next_free_time: Dict[Tuple[str, str, str], float] = defaultdict(float)
 
     for task in tasks:
-        curr_t = task["start_time"]
-        qty = task["quantity"]
-        path = task["path"]
-        batch = task["batch"]
-        
-        total_cost += path.base_cost_per_teu * qty
-        total_emis += path.base_emission_per_teu * qty
-        
-        path_wait_cost = 0.0
-        
+        curr_t = float(task["start_time"])
+        qty = float(task["quantity"])
+        path: Path = task["path"]
+        batch: Batch = task["batch"]
+
+        # base transport cost (distance-based) using stored path cost
+        total_cost += float(path.base_cost_per_teu) * qty
+
+        prev_mode = None
+
         for arc in path.arcs:
+            # -------- Transshipment at arc.from_node if mode changes
+            if prev_mode is not None and arc.mode != prev_mode:
+                node_j = arc.from_node
+                tc, tt_h = transship.get((node_j, prev_mode, arc.mode), (150.0, 3.0))
+                # cost
+                total_cost += float(tc) * qty
+                # time + processing cost
+                curr_t += float(tt_h)
+                total_cost += float(tt_h) * qty * waiting_cost["proc"]
+                # emission during transfer processing/waiting
+                if wait_emis_g_per_teu_h > 0 and tt_h > 0:
+                    total_emis_g += wait_emis_g_per_teu_h * qty * float(tt_h)
+
+            prev_mode = arc.mode
+
+            # -------- Timetable waiting (hold) at FROM node
             travel = arc.distance / max(arc.speed_kmh, 1.0)
-            
             if arc.mode == "road":
                 dep = curr_t
             else:
                 dep = next_departure_time(curr_t, tt_dict.get((arc.from_node, arc.to_node, arc.mode), []))
-            
-            # Timetable waiting cost
-            timetable_wait = dep - curr_t
-            path_wait_cost += timetable_wait * qty * WAITING_COST_PER_TEU_HOUR
 
-            arr_at_next = dep + travel
-            
-            # Congestion logic
+            timetable_wait = dep - curr_t
+            if timetable_wait > 0:
+                total_cost += timetable_wait * qty * waiting_cost["hold"]
+                if wait_emis_g_per_teu_h > 0:
+                    total_emis_g += wait_emis_g_per_teu_h * qty * timetable_wait
+                # NEW: hard cap check
+                _flag_wait48(batch.batch_id, "TIMETABLE", arc.from_node, timetable_wait, arc=arc)
+
+            # -------- Arc capacity queueing (CAP_{ijm}) at FROM node
+            arc_key = (arc.from_node, arc.to_node, arc.mode)
+            arc_free = arc_next_free_time[arc_key]
+            dep2 = max(dep, arc_free)
+
+            arc_wait = dep2 - dep
+            if arc_wait > 0:
+                total_cost += arc_wait * qty * waiting_cost["cong"]
+                if wait_emis_g_per_teu_h > 0:
+                    total_emis_g += wait_emis_g_per_teu_h * qty * arc_wait
+                # NEW: hard cap check
+                _flag_wait48(batch.batch_id, "ARC_QUEUE", arc.from_node, arc_wait, arc=arc)
+
+            arc_cap = max(float(arc.capacity), 1e-9)  # TEU per time-bucket
+            arc_service = qty / arc_cap  # hours (continuous service approximation)
+            arc_next_free_time[arc_key] = dep2 + arc_service
+            total_cost += arc_service * qty * waiting_cost["proc"]
+            if wait_emis_g_per_teu_h > 0 and arc_service > 0:
+                total_emis_g += wait_emis_g_per_teu_h * qty * arc_service
+
+            # depart and travel
+            arr_at_next = dep2 + travel
+
+            # -------- Border/customs at arrival node (hold) at TO node
+            info = node_border.get(arc.to_node)
+            if info and int(info.get("is_border", 0)) == 1:
+                cc = float(info.get("customs_h", 0.0))
+                if arc.mode == "road":
+                    bd = float(info.get("bd_road_h", 0.0))
+                elif arc.mode == "rail":
+                    bd = float(info.get("bd_rail_h", 0.0))
+                else:
+                    bd = float(info.get("bd_water_h", 0.0))
+                border_time = cc + bd
+                if border_time > 0:
+                    total_cost += border_time * qty * waiting_cost["hold"]
+                    arr_at_next += border_time
+                    if wait_emis_g_per_teu_h > 0:
+                        total_emis_g += wait_emis_g_per_teu_h * qty * border_time
+                    # NEW: hard cap check
+                    _flag_wait48(batch.batch_id, "BORDER", arc.to_node, border_time, arc=arc)
+
+            # -------- Node capacity queueing at next node (cong + proc) at TO node
             next_node = arc.to_node
-            proc_rate = node_caps.get(next_node, 1e18)
+            proc_rate = max(node_caps.get(next_node, 1e18), 1e-9)  # TEU per bucket
             service_time = qty / proc_rate
-            
+
             node_free = node_next_free_time[next_node]
             start_service_time = max(arr_at_next, node_free)
-            
-            wait_time = start_service_time - arr_at_next
+            node_wait = start_service_time - arr_at_next
+            if node_wait > 0:
+                total_cost += node_wait * qty * waiting_cost["cong"]
+                if wait_emis_g_per_teu_h > 0:
+                    total_emis_g += wait_emis_g_per_teu_h * qty * node_wait
+                # NEW: hard cap check
+                _flag_wait48(batch.batch_id, "NODE_QUEUE", arc.to_node, node_wait, arc=arc)
+
             finish_service_time = start_service_time + service_time
             node_next_free_time[next_node] = finish_service_time
-            
+            total_cost += service_time * qty * waiting_cost["proc"]
+            if wait_emis_g_per_teu_h > 0 and service_time > 0:
+                total_emis_g += wait_emis_g_per_teu_h * qty * service_time
+
             curr_t = finish_service_time
-            
-            # Queueing waiting cost
-            path_wait_cost += wait_time * qty * WAITING_COST_PER_TEU_HOUR
+
+            # -------- Emission + carbon cost for this arc (regional heterogeneity)
+            rg = region_group_of_node.get(arc.from_node, region_group_of_node.get(arc.to_node, "WE"))
+            ef = emis_factor_g_teu_km.get((rg, arc.mode), 0.0)  # gCO2 per TEU-km
+            emis_g = ef * arc.distance * qty
+            total_emis_g += emis_g
+
+            ct = carbon_tax_usd.get(rg, 0.0)  # USD/tonCO2
+            th = int(theta.get((rg, arc.mode), 0))
+            carbon_cost = (emis_g / 1e6) * ct * th  # g -> ton
+            total_cost += carbon_cost
 
         final_arrival = curr_t
-        total_cost += path_wait_cost
-        
         makespan = max(makespan, final_arrival)
 
         if final_arrival > batch.LT + 1e-9:
             late = True
             penalty += (final_arrival - batch.LT) * 500.0
 
-    ind.objectives = (total_cost + penalty, total_emis + penalty, makespan)
+    total_emis_ton = total_emis_g / 1e6
+
+    ind.objectives = (total_cost + penalty, total_emis_ton + penalty * 1e-6, makespan)
     ind.penalty = penalty
-    ind.feasible = not (missing or late)
+    ind.feasible = not (missing or late or wait48_any)
     ind.infeas_reason = {
         "missing_alloc": int(missing),
         "late": int(late),
+        "wait48": int(wait48_any),
         "arc_cap": 0,
         "node_cap": 0
     }
+    ind.debug_info["batch_wait48"] = dict(batch_wait48)
+    ind.debug_info["batch_wait48_first"] = dict(batch_wait48_first)
 
 
 # ========================
 # 7. Repair & GA Operators
 # ========================
 
-def repair_individual(ind: Individual, batches: List[Batch], path_lib, tt_dict):
+def repair_individual(ind: Individual,
+                      batches: List[Batch],
+                      path_lib,
+                      tt_dict,
+                      transship,
+                      node_border):
     for b in batches:
         od = (b.origin, b.destination)
         key = (b.origin, b.destination, b.batch_id)
@@ -675,7 +972,7 @@ def repair_individual(ind: Individual, batches: List[Batch], path_lib, tt_dict):
             best_feas_arr = float("inf")
 
             for p in paths:
-                arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+                arr = b.ET + simulate_time_only(p, b.ET, tt_dict, transship, node_border)
                 if arr < best_arr:
                     best_arr = arr
                     best = p
@@ -692,7 +989,7 @@ def repair_individual(ind: Individual, batches: List[Batch], path_lib, tt_dict):
         for a in allocs:
             if a.share <= 1e-12:
                 continue
-            arr = b.ET + simulate_time_only(a.path, b.ET, tt_dict)
+            arr = b.ET + simulate_time_only(a.path, b.ET, tt_dict, transship, node_border)
             if arr <= b.LT + 1e-9:
                 kept.append(a)
 
@@ -705,20 +1002,75 @@ def repair_individual(ind: Individual, batches: List[Batch], path_lib, tt_dict):
             best_feas_arr = float("inf")
 
             for p in paths:
-                arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+                arr = b.ET + simulate_time_only(p, b.ET, tt_dict, transship, node_border)
                 if arr < best_arr:
                     best_arr = arr
                     best = p
                 if arr <= b.LT + 1e-9 and arr < best_feas_arr:
                     best_feas_arr = arr
                     best_feas = p
-            
+
             chosen = best_feas if best_feas else best
             if chosen:
                 ind.od_allocations[key] = [PathAllocation(path=chosen, share=1.0)]
 
 
-def random_initial_individual(batches, path_lib, tt_dict, max_paths=3) -> Individual:
+def repair_wait48_post_eval(ind: Individual,
+                            batches: List[Batch],
+                            path_lib,
+                            tt_dict,
+                            transship,
+                            node_border) -> bool:
+    """
+    Post-eval hard repair: only triggered when wait48 happened.
+    Strategy:
+    - For each violated batch, read first violation (where,node).
+    - Prefer time-feasible paths that avoid the violated node.
+    - If none, fall back to best time-feasible path (ignoring avoid).
+    - If still none, keep original (let GA淘汰).
+    """
+    info = (ind.debug_info or {}).get("batch_wait48_first", {})
+    if not info:
+        return False
+
+    changed = False
+    bid2batch = {b.batch_id: b for b in batches}
+
+    def arr_time(b: Batch, p: Path) -> float:
+        return b.ET + simulate_time_only(p, b.ET, tt_dict, transship, node_border)
+
+    for bid, v in info.items():
+        b = bid2batch.get(int(bid))
+        if b is None:
+            continue
+
+        od = (b.origin, b.destination)
+        key = (b.origin, b.destination, b.batch_id)
+        paths = path_lib.get(od, [])
+        if not paths:
+            continue
+
+        avoid_node = str(v.get("node", ""))
+
+        cand_avoid = [p for p in paths if (avoid_node not in p.nodes)]
+        feas_avoid = [p for p in cand_avoid if arr_time(b, p) <= b.LT + 1e-9]
+
+        feas_all = [p for p in paths if arr_time(b, p) <= b.LT + 1e-9]
+
+        chosen = None
+        if feas_avoid:
+            chosen = min(feas_avoid, key=lambda p: arr_time(b, p))
+        elif feas_all:
+            chosen = min(feas_all, key=lambda p: arr_time(b, p))
+
+        if chosen is not None:
+            ind.od_allocations[key] = [PathAllocation(path=chosen, share=1.0)]
+            changed = True
+
+    return changed
+
+
+def random_initial_individual(batches, path_lib, tt_dict, transship, node_border, max_paths=3) -> Individual:
     ind = Individual()
     for b in batches:
         od = (b.origin, b.destination)
@@ -728,7 +1080,7 @@ def random_initial_individual(batches, path_lib, tt_dict, max_paths=3) -> Indivi
 
         feas = []
         for p in paths:
-            arr = b.ET + simulate_time_only(p, b.ET, tt_dict)
+            arr = b.ET + simulate_time_only(p, b.ET, tt_dict, transship, node_border)
             if arr <= b.LT + 1e-9:
                 feas.append(p)
         pool = feas if feas else paths
@@ -738,7 +1090,7 @@ def random_initial_individual(batches, path_lib, tt_dict, max_paths=3) -> Indivi
         key = (b.origin, b.destination, b.batch_id)
         ind.od_allocations[key] = merge_and_normalize([PathAllocation(path=p, share=random.random()) for p in chosen])
 
-    repair_individual(ind, batches, path_lib, tt_dict)
+    repair_individual(ind, batches, path_lib, tt_dict, transship, node_border)
     return ind
 
 
@@ -877,7 +1229,71 @@ def _mut_mode_single_arc(allocs: List[PathAllocation]):
     return merge_and_normalize(allocs)
 
 
-def mutate_structural(ind: Individual, batches: List[Batch], path_lib):
+def _allocs_signature(allocs: List[PathAllocation], share_round: int = 8) -> Tuple:
+    items = []
+    for a in allocs:
+        p = a.path
+        struct = (tuple(p.nodes), tuple(p.modes))
+        items.append((struct, round(float(a.share), share_round)))
+    items.sort(key=lambda x: (x[0], x[1]))
+    return tuple(items)
+
+
+@dataclass
+class MutationTracker:
+    records: List[Dict] = field(default_factory=list)
+
+    def start_gen(self, gen: int):
+        self.records.append({
+            "gen": gen,
+            "attempt_add": 0, "exec_add": 0,
+            "attempt_del": 0, "exec_del": 0,
+            "attempt_mod": 0, "exec_mod": 0,
+            "attempt_mode": 0, "exec_mode": 0,
+        })
+
+    def _cur(self) -> Dict:
+        if not self.records:
+            raise RuntimeError("MutationTracker: start_gen() must be called before record().")
+        return self.records[-1]
+
+    def record(self, op: str, executed: bool):
+        r = self._cur()
+        key_a = f"attempt_{op}"
+        key_e = f"exec_{op}"
+        if key_a in r:
+            r[key_a] += 1
+        if executed and key_e in r:
+            r[key_e] += 1
+
+    def finalize_current_gen(self):
+        r = self._cur()
+        attempt_total = int(r["attempt_add"] + r["attempt_del"] + r["attempt_mod"] + r["attempt_mode"])
+        exec_total = int(r["exec_add"] + r["exec_del"] + r["exec_mod"] + r["exec_mode"])
+        r["attempt_total"] = attempt_total
+        r["exec_total"] = exec_total
+
+        def safe_div(a, b):
+            return float(a) / float(b) if b > 0 else 0.0
+
+        r["attempt_share_add"] = safe_div(r["attempt_add"], attempt_total)
+        r["attempt_share_del"] = safe_div(r["attempt_del"], attempt_total)
+        r["attempt_share_mod"] = safe_div(r["attempt_mod"], attempt_total)
+        r["attempt_share_mode"] = safe_div(r["attempt_mode"], attempt_total)
+
+        r["exec_share_add"] = safe_div(r["exec_add"], exec_total)
+        r["exec_share_del"] = safe_div(r["exec_del"], exec_total)
+        r["exec_share_mod"] = safe_div(r["exec_mod"], exec_total)
+        r["exec_share_mode"] = safe_div(r["exec_mode"], exec_total)
+
+        r["success_rate"] = safe_div(exec_total, attempt_total)
+        r["success_add"] = safe_div(r["exec_add"], r["attempt_add"])
+        r["success_del"] = safe_div(r["exec_del"], r["attempt_del"])
+        r["success_mod"] = safe_div(r["exec_mod"], r["attempt_mod"])
+        r["success_mode"] = safe_div(r["exec_mode"], r["attempt_mode"])
+
+
+def mutate_structural(ind: Individual, batches: List[Batch], path_lib, tracker: Optional[MutationTracker] = None):
     _build_arc_caches_from_path_lib(path_lib)
     if not batches:
         return
@@ -897,20 +1313,28 @@ def mutate_structural(ind: Individual, batches: List[Batch], path_lib):
         ("mode", W_MODE),
     ])
 
-    if op == "add":
-        allocs = _mut_add_path(allocs, od, path_lib)
-    elif op == "del":
-        allocs = _mut_delete_path(allocs)
-    elif op == "mod":
-        allocs = _mut_modify_share(allocs)
-    else:
-        allocs = _mut_mode_single_arc(allocs)
+    before_sig = _allocs_signature(allocs)
 
-    ind.od_allocations[key] = allocs
+    if op == "add":
+        allocs2 = _mut_add_path(allocs, od, path_lib)
+    elif op == "del":
+        allocs2 = _mut_delete_path(allocs)
+    elif op == "mod":
+        allocs2 = _mut_modify_share(allocs)
+    else:
+        allocs2 = _mut_mode_single_arc(allocs)
+
+    after_sig = _allocs_signature(allocs2)
+    executed = (after_sig != before_sig)
+
+    if tracker is not None:
+        tracker.record(op, executed)
+
+    ind.od_allocations[key] = allocs2
 
 
 # ========================
-# 8. Metrics & timing (NEW)
+# 8. Metrics & timing
 # ========================
 
 class HypervolumeCalculator:
@@ -945,7 +1369,7 @@ class HypervolumeCalculator:
         return float(ratio)
 
 
-def unique_individuals_by_objectives(front: List[Individual], tol: float = 1e-3) -> List[Individual]:
+def unique_individuals_by_objectives(front: List[Individual], tol: float = 1e-6) -> List[Individual]:
     unique: List[Individual] = []
     seen_objs: List[Tuple[float, float, float]] = []
 
@@ -1188,7 +1612,7 @@ def tournament_select(pop: List[Individual], dists: Dict[Individual, float], ran
 
 
 def _count_infeas(pop: List[Individual]) -> Dict[str, int]:
-    agg = {"missing_alloc": 0, "late": 0, "arc_cap": 0, "node_cap": 0}
+    agg = {"missing_alloc": 0, "late": 0, "wait48": 0, "arc_cap": 0, "node_cap": 0}
     for ind in pop:
         if ind.feasible:
             continue
@@ -1198,26 +1622,30 @@ def _count_infeas(pop: List[Individual]) -> Dict[str, int]:
     return agg
 
 
-def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_every=10):
+def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=400, log_every=10):
     stats = RunStats()
     t_run0 = time.perf_counter()
 
     print("Loading data...")
-    node_names, node_caps, arcs, timetables, batches = load_network_from_extended(filename)
+    (node_names, node_caps, arcs, timetables, batches,
+     region_group_of_node, carbon_tax_usd, theta,
+     emis_factor_g_teu_km, transship, node_border, waiting_cost) = load_network_from_extended(filename)
+
     tt_dict = build_timetable_dict(timetables)
 
-    # Use Time-Dependent Path Library Generation
+    # Path library
     path_lib = build_path_library(arcs, batches, tt_dict, K=100, repeats=40)
-
-    bad = report_time_feasible_coverage(batches, path_lib, tt_dict)
+    _ = report_time_feasible_coverage(batches, path_lib, tt_dict, transship, node_border)
 
     print("Initializing Population...")
     t_init0 = time.perf_counter()
     population = []
     for _ in range(pop_size):
-        ind = random_initial_individual(batches, path_lib, tt_dict)
+        ind = random_initial_individual(batches, path_lib, tt_dict, transship, node_border)
         t0 = time.perf_counter()
-        evaluate_individual(ind, batches, arcs, tt_dict, node_caps)
+        evaluate_individual(ind, batches, tt_dict, node_caps,
+                            region_group_of_node, carbon_tax_usd, theta,
+                            emis_factor_g_teu_km, transship, node_border, waiting_cost)
         dt = time.perf_counter() - t0
         stats.evaluation_time += dt
         stats.evaluation_calls += 1
@@ -1229,8 +1657,11 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
     history_fronts: List[Tuple[int, List[Tuple[float, float, float]]]] = []
     all_feasible_front0_objs: List[Tuple[float, float, float]] = []
 
+    mut_tracker = MutationTracker()
+
     for gen in range(generations):
         t_gen0 = time.perf_counter()
+        mut_tracker.start_gen(gen)
 
         t0 = time.perf_counter()
         fronts = non_dominated_sort(population)
@@ -1241,7 +1672,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
         front0 = fronts[0]
         feasible_front0 = [ind for ind in front0 if ind.feasible]
         base_front = feasible_front0 if feasible_front0 else front0
-        front0_unique = unique_individuals_by_objectives(base_front, tol=1e-3)
+        front0_unique = unique_individuals_by_objectives(base_front, tol=1e-6)
 
         current_front_objs = [ind.objectives for ind in front0_unique]
         history_fronts.append((gen, current_front_objs))
@@ -1288,12 +1719,12 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
                 gen_crossover_time += dt
                 gen_crossover_calls += 1
             else:
-                c1 = random_initial_individual(batches, path_lib, tt_dict)
-                c2 = random_initial_individual(batches, path_lib, tt_dict)
+                c1 = random_initial_individual(batches, path_lib, tt_dict, transship, node_border)
+                c2 = random_initial_individual(batches, path_lib, tt_dict, transship, node_border)
 
             if random.random() < 0.3:
                 t0 = time.perf_counter()
-                mutate_structural(c1, batches, path_lib)
+                mutate_structural(c1, batches, path_lib, tracker=mut_tracker)
                 dt = time.perf_counter() - t0
                 stats.mutation_time += dt
                 stats.mutation_calls += 1
@@ -1302,37 +1733,69 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
 
             if random.random() < 0.3:
                 t0 = time.perf_counter()
-                mutate_structural(c2, batches, path_lib)
+                mutate_structural(c2, batches, path_lib, tracker=mut_tracker)
                 dt = time.perf_counter() - t0
                 stats.mutation_time += dt
                 stats.mutation_calls += 1
                 gen_mutation_time += dt
                 gen_mutation_calls += 1
 
-            repair_individual(c1, batches, path_lib, tt_dict)
-            repair_individual(c2, batches, path_lib, tt_dict)
+            repair_individual(c1, batches, path_lib, tt_dict, transship, node_border)
+            repair_individual(c2, batches, path_lib, tt_dict, transship, node_border)
 
+            # ----- evaluate c1
             t0 = time.perf_counter()
-            evaluate_individual(c1, batches, arcs, tt_dict, node_caps)
+            evaluate_individual(c1, batches, tt_dict, node_caps,
+                                region_group_of_node, carbon_tax_usd, theta,
+                                emis_factor_g_teu_km, transship, node_border, waiting_cost)
             dt = time.perf_counter() - t0
             stats.evaluation_time += dt
             stats.evaluation_calls += 1
             gen_eval_time += dt
             gen_eval_calls += 1
 
+            # NEW: post-eval hard repair only when wait48 infeasible
+            if (not c1.feasible) and int((c1.infeas_reason or {}).get("wait48", 0)) == 1:
+                if repair_wait48_post_eval(c1, batches, path_lib, tt_dict, transship, node_border):
+                    t0 = time.perf_counter()
+                    evaluate_individual(c1, batches, tt_dict, node_caps,
+                                        region_group_of_node, carbon_tax_usd, theta,
+                                        emis_factor_g_teu_km, transship, node_border, waiting_cost)
+                    dt = time.perf_counter() - t0
+                    stats.evaluation_time += dt
+                    stats.evaluation_calls += 1
+                    gen_eval_time += dt
+                    gen_eval_calls += 1
+
+            # ----- evaluate c2
             t0 = time.perf_counter()
-            evaluate_individual(c2, batches, arcs, tt_dict, node_caps)
+            evaluate_individual(c2, batches, tt_dict, node_caps,
+                                region_group_of_node, carbon_tax_usd, theta,
+                                emis_factor_g_teu_km, transship, node_border, waiting_cost)
             dt = time.perf_counter() - t0
             stats.evaluation_time += dt
             stats.evaluation_calls += 1
             gen_eval_time += dt
             gen_eval_calls += 1
+
+            # NEW: post-eval hard repair only when wait48 infeasible
+            if (not c2.feasible) and int((c2.infeas_reason or {}).get("wait48", 0)) == 1:
+                if repair_wait48_post_eval(c2, batches, path_lib, tt_dict, transship, node_border):
+                    t0 = time.perf_counter()
+                    evaluate_individual(c2, batches, tt_dict, node_caps,
+                                        region_group_of_node, carbon_tax_usd, theta,
+                                        emis_factor_g_teu_km, transship, node_border, waiting_cost)
+                    dt = time.perf_counter() - t0
+                    stats.evaluation_time += dt
+                    stats.evaluation_calls += 1
+                    gen_eval_time += dt
+                    gen_eval_calls += 1
 
             offspring.append(c1)
             offspring.append(c2)
 
         combined = population + offspring
-        
+
         t0 = time.perf_counter()
         fronts2 = non_dominated_sort(combined)
         dt = time.perf_counter() - t0
@@ -1355,6 +1818,8 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
 
         population = new_pop
 
+        mut_tracker.finalize_current_gen()
+
         gen_total = time.perf_counter() - t_gen0
         stats.add_gen_record({
             "gen": gen,
@@ -1373,7 +1838,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
     front0 = final_fronts[0]
     feasible_front0 = [ind for ind in front0 if ind.feasible]
     base_front = feasible_front0 if feasible_front0 else front0
-    pareto_front = unique_individuals_by_objectives(base_front, tol=1e-3)
+    pareto_front = unique_individuals_by_objectives(base_front, tol=1e-6)
 
     final_feasible = [ind for ind in pareto_front if ind.feasible]
     final_feasible_nd_objs = [ind.objectives for ind in (final_feasible if final_feasible else pareto_front)]
@@ -1388,7 +1853,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
     print(f"Final Pareto size (unique, prefer feasible): {len(pareto_front)}")
     print("=============================================\n")
 
-    return population, pareto_front, batches, history_fronts, stats, final_feasible_nd_objs, all_feasible_front0_objs
+    return population, pareto_front, batches, history_fronts, stats, final_feasible_nd_objs, all_feasible_front0_objs, mut_tracker
 
 
 # ========================
@@ -1396,14 +1861,19 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200, log_
 # ========================
 
 def save_pareto_solutions(pareto: List[Individual], batches: List[Batch], filename: str = "result.txt"):
-    pareto = unique_individuals_by_objectives(pareto, tol=1e-3)
+    pareto = unique_individuals_by_objectives(pareto, tol=1e-6)
     with open(filename, "w", encoding="utf-8") as f:
         f.write("===== NSGA-II Pareto Solutions (Unique, Feasible-first) =====\n\n")
         for i, ind in enumerate(pareto):
             cost, emit, time_ = ind.objectives
             f.write(f"===== Solution {i} =====\n")
-            f.write(f"Objectives: Cost={cost:.6f}, Emission={emit:.6f}, Time={time_:.6f}, Penalty={ind.penalty:.6f}\n")
-            f.write(f"Feasible={ind.feasible}\n\n")
+            f.write(f"Objectives: Cost={cost:.6f}, Emission_ton={emit:.6f}, Time={time_:.6f}, Penalty={ind.penalty:.6f}\n")
+            f.write(f"Feasible={ind.feasible}\n")
+            f.write(f"InfeasReason={ind.infeas_reason}\n")
+            if int((ind.infeas_reason or {}).get("wait48", 0)) == 1:
+                f.write(f"wait48_first={ind.debug_info.get('batch_wait48_first', {})}\n")
+            f.write("\n")
+
             for b in batches:
                 key = (b.origin, b.destination, b.batch_id)
                 allocs = ind.od_allocations.get(key, [])
@@ -1436,7 +1906,7 @@ def plot_pareto_evolution_3d(history_fronts):
         ax1.scatter(xs, ys, zs, color=colors[gen], alpha=alpha, s=s, label=label)
 
     ax1.set_xlabel('Cost')
-    ax1.set_ylabel('Emission')
+    ax1.set_ylabel('Emission (ton CO2)')
     ax1.set_zlabel('Time')
     ax1.set_title('Pareto Front Evolution (Color=Generation)')
     ax1.legend()
@@ -1520,10 +1990,91 @@ def plot_mean_convergence_line(all_run_metrics: List[List[float]], title: str, y
     print(f"[Saved] {filename}")
 
 
+def save_mutation_stats_and_plots(tracker: MutationTracker,
+                                 csv_name="mutation_stats_best_run.csv"):
+    if not tracker.records:
+        print("[WARN] No mutation records; skip mutation plots.")
+        return
+
+    df = pd.DataFrame(tracker.records)
+    df.to_csv(csv_name, index=False)
+    print(f"[Saved] {csv_name}")
+
+    gens = df["gen"].values
+
+    plt.figure(figsize=(10, 6))
+    plt.stackplot(
+        gens,
+        df["attempt_share_add"].values,
+        df["attempt_share_del"].values,
+        df["attempt_share_mod"].values,
+        df["attempt_share_mode"].values,
+        labels=["add", "del", "mod", "mode"]
+    )
+    plt.xlabel("Generation")
+    plt.ylabel("Share")
+    plt.title("Mutation Attempt Share (roulette selected)")
+    plt.legend(loc="upper right")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("mutation_attempt_share_stacked.png", dpi=300)
+    plt.close()
+    print("[Saved] mutation_attempt_share_stacked.png")
+
+    plt.figure(figsize=(10, 6))
+    plt.stackplot(
+        gens,
+        df["exec_share_add"].values,
+        df["exec_share_del"].values,
+        df["exec_share_mod"].values,
+        df["exec_share_mode"].values,
+        labels=["add", "del", "mod", "mode"]
+    )
+    plt.xlabel("Generation")
+    plt.ylabel("Share")
+    plt.title("Mutation Execution Share (actually changed gene)")
+    plt.legend(loc="upper right")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("mutation_exec_share_stacked.png", dpi=300)
+    plt.close()
+    print("[Saved] mutation_exec_share_stacked.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(gens, df["success_rate"].values, linewidth=2)
+    plt.xlabel("Generation")
+    plt.ylabel("exec_total / attempt_total")
+    plt.title("Overall Mutation Success Rate")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("mutation_success_rate.png", dpi=300)
+    plt.close()
+    print("[Saved] mutation_success_rate.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(gens, df["success_add"].values, linewidth=2, label="add")
+    plt.plot(gens, df["success_del"].values, linewidth=2, label="del")
+    plt.plot(gens, df["success_mod"].values, linewidth=2, label="mod")
+    plt.plot(gens, df["success_mode"].values, linewidth=2, label="mode")
+    plt.xlabel("Generation")
+    plt.ylabel("exec_op / attempt_op")
+    plt.title("Per-Operator Mutation Success Rate")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("mutation_operator_success_rate.png", dpi=300)
+    plt.close()
+    print("[Saved] mutation_operator_success_rate.png")
+
+
+# ========================
+# 11. Main
+# ========================
+
 if __name__ == "__main__":
     filename = "data.xlsx"
     pop_size = 60
-    generations = 200  # Restored to 200 as per previous good runs
+    generations = 400
     runs = 30
 
     print(f"\nStarting Experiment: Runs={runs}, Gen={generations}, Pop={pop_size}\n")
@@ -1541,7 +2092,7 @@ if __name__ == "__main__":
 
         print(f"\n========== RUN {run_id}/{runs-1}, seed={seed} ==========\n")
 
-        pop, pareto, batches, h_fronts, stats, final_feas_nd, feas_front0_allgens = run_nsga2_analytics(
+        pop, pareto, batches, h_fronts, stats, final_feas_nd, feas_front0_allgens, mut_tracker = run_nsga2_analytics(
             filename=filename,
             pop_size=pop_size,
             generations=generations,
@@ -1558,7 +2109,8 @@ if __name__ == "__main__":
             "pareto": pareto,
             "batches": batches,
             "history_fronts": h_fronts,
-            "stats": stats
+            "stats": stats,
+            "mutation_tracker": mut_tracker
         })
 
         run_summary = stats.summary_dict()
@@ -1640,6 +2192,8 @@ if __name__ == "__main__":
         ylabel="Spacing (SP)",
         filename="best_spacing_line.png"
     )
+
+    save_mutation_stats_and_plots(best_item["mutation_tracker"], csv_name="mutation_stats_best_run.csv")
 
     best_pareto = best_item["pareto"]
     best_batches = best_item["batches"]
