@@ -69,6 +69,11 @@ W_MOD = 0.35
 W_MODE = 0.20
 OPS = ["add", "del", "mod", "mode"]
 
+# ---- Path library diversity (ONLY change you asked for)
+PATHS_TOPK_PER_CRITERION = 30   # take top 30 by cost/time/emission each
+PATH_LIB_CAP_TOTAL = 90         # union cap (30*3=90). keep as 90.
+DFS_MAX_PATHS_PER_OD = 1200     # increase DFS sampling pool to make top-k meaningful
+
 
 # ========================
 # Helpers
@@ -449,6 +454,41 @@ def repair_arc_seq_with_road_fallback(
     return new_seq
 
 
+def select_topk_by_cost_time_emis(paths: List[Path], k: int = 30, cap_total: int = 90) -> List[Path]:
+    """
+    YOUR REQUEST:
+    take Top-k by each criterion (cost, time, emission), then union and dedupe.
+    - Maximum size is cap_total (default 90=30*3).
+    """
+    if not paths:
+        return []
+
+    by_cost = sorted(paths, key=lambda p: p.base_cost_per_teu)
+    by_time = sorted(paths, key=lambda p: p.base_travel_time_h)
+    by_emis = sorted(paths, key=lambda p: p.base_emission_per_teu)
+
+    picked: List[Path] = []
+    used = set()
+
+    def add_list(lst, kk):
+        nonlocal picked, used
+        for p in lst[:kk]:
+            if p not in used:
+                picked.append(p)
+                used.add(p)
+
+    add_list(by_cost, k)
+    add_list(by_time, k)
+    add_list(by_emis, k)
+
+    # If too many, trim with a stable rule (keep diversity):
+    # Here: keep the earliest appearance order (cost->time->emis).
+    if cap_total is not None and len(picked) > cap_total:
+        picked = picked[:cap_total]
+
+    return picked
+
+
 def build_path_library(node_names, arcs, batches, tt_dict, arc_lookup) -> Dict[Tuple[str, str], List[Path]]:
     graph = build_graph(arcs)
     path_lib: Dict[Tuple[str, str], List[Path]] = {}
@@ -459,7 +499,11 @@ def build_path_library(node_names, arcs, batches, tt_dict, arc_lookup) -> Dict[T
         if od in path_lib:
             continue
 
-        arc_paths = random_dfs_paths(graph, b.origin, b.destination, max_len=12, max_paths=200)
+        arc_paths = random_dfs_paths(
+            graph, b.origin, b.destination,
+            max_len=12,
+            max_paths=DFS_MAX_PATHS_PER_OD
+        )
         paths_for_od: List[Path] = []
 
         for arc_seq in arc_paths:
@@ -486,8 +530,12 @@ def build_path_library(node_names, arcs, batches, tt_dict, arc_lookup) -> Dict[T
             next_path_id += 1
 
         if paths_for_od:
-            paths_for_od.sort(key=lambda p: p.base_cost_per_teu)
-            path_lib[od] = paths_for_od[:30]
+            # <<< CHANGED HERE: instead of cost-top30, use union of (cost/time/emis)-top30 each >>>
+            path_lib[od] = select_topk_by_cost_time_emis(
+                paths_for_od,
+                k=PATHS_TOPK_PER_CRITERION,
+                cap_total=PATH_LIB_CAP_TOTAL
+            )
 
     return path_lib
 
@@ -1661,6 +1709,7 @@ if __name__ == "__main__":
     print(f"[CONFIG] HARD_TIME_WINDOW={HARD_TIME_WINDOW}  (False=lateness soft via cost; True=lateness hard)")
     print(f"[CONFIG] Waiting in objectives: cost_per_teu_h default={WAITING_COST_PER_TEU_HOUR_DEFAULT}, emis_g_per_teu_h default={WAIT_EMISSION_gCO2_per_TEU_H_DEFAULT}")
     print(f"[CONFIG] Lateness in cost: LATE_COST_PER_TEU_HOUR={LATE_COST_PER_TEU_HOUR:.3e}")
+    print(f"[CONFIG] Path lib: topK per criterion={PATHS_TOPK_PER_CRITERION}, cap_total={PATH_LIB_CAP_TOTAL}, dfs_pool={DFS_MAX_PATHS_PER_OD}")
 
     for run_id in range(runs):
         seed = 1000 + run_id
