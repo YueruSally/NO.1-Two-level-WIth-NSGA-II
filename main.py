@@ -31,6 +31,8 @@ HARD_TIME_WINDOW = False
 PEN_MISS_TT = 5e7
 PEN_MISS_ALLOC = 1e9
 PEN_CAP_EXCESS_PER_TEU = 5e7
+# ✅ NEW: Node capacity excess penalty
+PEN_NODE_CAP_EXCESS_PER_TEU = 5e7
 
 # ---- Scheme A: lateness and waiting are in objectives (cost/emission)
 WAITING_COST_PER_TEU_HOUR_DEFAULT = 0.5
@@ -279,6 +281,14 @@ def load_waiting_params(xls: pd.ExcelFile) -> Tuple[float, float]:
 
 
 def load_network_from_extended(filename: str):
+    """
+    ✅ UPDATED: returns node_region + node_caps as well.
+    Node capacity columns (pick first found):
+      - NodeCap_TEU_per_day
+      - Capacity_TEU
+      - Throughput_TEU
+    If none provided -> treated as unlimited (1e12 TEU/day).
+    """
     xls = pd.ExcelFile(filename)
 
     nodes_df = pd.read_excel(xls, "Nodes")
@@ -288,12 +298,25 @@ def load_network_from_extended(filename: str):
             nodes_df["Region"].astype(str).str.strip())
     )
 
+    # ✅ NEW: node capacities (TEU/day -> TEU/bucket)
+    DAILY_HOURS = 24.0
+    node_caps: Dict[str, float] = {}
+    for _, row in nodes_df.iterrows():
+        n = str(row.get("EnglishName", "")).strip()
+        raw = None
+        for col in ["NodeCap_TEU_per_day", "Capacity_TEU", "Throughput_TEU"]:
+            if col in nodes_df.columns and (not pd.isna(row.get(col, np.nan))):
+                raw = safe_float(row.get(col), default=None)
+                break
+        if raw is None:
+            raw = 1e12  # unlimited if not provided
+        node_caps[n] = float(raw) * (TIME_BUCKET_H / DAILY_HOURS)
+
     waiting_cost_per_teu_h, wait_emis_g_per_teu_h = load_waiting_params(xls)
 
     arcs_df = pd.read_excel(xls, "Arcs_All")
     arcs: List[Arc] = []
 
-    DAILY_HOURS = 24.0  # assumes Capacity_TEU is TEU/day
     for _, row in arcs_df.iterrows():
         mode = normalize_mode(row.get("Mode", "road"))
 
@@ -368,7 +391,8 @@ def load_network_from_extended(filename: str):
             ))
 
     print(f"[INFO] Number of batches loaded: {len(batches)}")
-    return node_names, arcs, timetables, batches, waiting_cost_per_teu_h, wait_emis_g_per_teu_h
+    print(f"[INFO] Loaded node capacities for {len(node_caps)} nodes (TEU/bucket).")
+    return node_names, node_region, node_caps, arcs, timetables, batches, waiting_cost_per_teu_h, wait_emis_g_per_teu_h
 
 
 def build_graph(arcs: List[Arc]) -> Dict[str, List[Tuple[str, Arc]]]:
@@ -571,14 +595,20 @@ def simulate_path_time_capacity(
     flow_teu: float,
     tt_dict,
     arc_flow_map,
+    node_flow_map,   # ✅ NEW: node throughput accounting (Scheme A)
 ) -> Tuple[float, float, int]:
     """
     Returns:
       travel_time_h, total_wait_h, miss_tt_count
     If missing timetable on non-road -> returns (inf, inf, miss_tt)
 
-    NOTE: timetable selection logic is MODIFIED to match Program B:
+    NOTE: timetable selection logic matches Program B:
           - for non-road, uses ONLY entries[0]
+
+    ✅ Node capacity scheme (Plan A):
+      - For every arc arrival node v at time arr:
+          node_flow_map[(v, int(arr))] += flow_teu
+      - This counts all arrival handling at nodes.
     """
     t = batch.ET
     total_wait = 0.0
@@ -596,7 +626,6 @@ def simulate_path_time_capacity(
             miss_tt += 1
             return float("inf"), float("inf"), miss_tt
 
-        # MODIFIED: Program B uses entries[0] only (instead of min across all)
         dep = t if not entries else next_departure_time_programB_first_entry_only(t, entries)
 
         wait_here = max(0.0, dep - t)
@@ -604,10 +633,16 @@ def simulate_path_time_capacity(
 
         arr = dep + travel_time
 
+        # --- Arc capacity accounting (existing)
         start_slot = int(dep)
         arc_key = (arc.from_node, arc.to_node, arc.mode)
         slot_key = (arc_key, start_slot)
         arc_flow_map[slot_key] = arc_flow_map.get(slot_key, 0.0) + flow_teu
+
+        # ✅ Node capacity accounting (Plan A): count arrival handling at node
+        arrive_node = arc.to_node
+        arr_slot = int(arr)
+        node_flow_map[(arrive_node, arr_slot)] = node_flow_map.get((arrive_node, arr_slot), 0.0) + flow_teu
 
         t = arr
 
@@ -620,18 +655,22 @@ def evaluate_individual(
     arcs: List[Arc],
     tt_dict,
     waiting_cost_per_teu_h: float,
-    wait_emis_g_per_teu_h: float
+    wait_emis_g_per_teu_h: float,
+    node_caps: Dict[str, float],   # ✅ NEW
 ):
     total_cost = 0.0
     total_emission_g = 0.0
     makespan = 0.0
 
     arc_flow_map: Dict[Tuple[Tuple[str, str, str], int], float] = {}
+    node_flow_map: Dict[Tuple[str, int], float] = {}  # ✅ NEW
+
     arc_caps = {(a.from_node, a.to_node, a.mode): a.capacity for a in arcs}
 
     miss_alloc = 0
     miss_tt = 0
     cap_excess = 0.0
+    node_cap_excess = 0.0  # ✅ NEW
 
     late_h_total = 0.0
     late_teu_h_total = 0.0
@@ -657,7 +696,9 @@ def evaluate_individual(
             total_cost += p.base_cost_per_teu * flow
             total_emission_g += p.base_emission_per_teu * flow
 
-            travel_time, wait_h, mtt = simulate_path_time_capacity(p, b, flow, tt_dict, arc_flow_map)
+            travel_time, wait_h, mtt = simulate_path_time_capacity(
+                p, b, flow, tt_dict, arc_flow_map, node_flow_map  # ✅ NEW
+            )
 
             if math.isinf(travel_time):
                 miss_tt += mtt
@@ -682,21 +723,29 @@ def evaluate_individual(
 
         makespan = max(makespan, batch_finish_time)
 
+    # --- Arc cap excess (existing)
     for (arc_key, slot), flow in arc_flow_map.items():
         cap = arc_caps.get(arc_key, 1e9)
         if flow > cap:
             cap_excess += (flow - cap)
 
+    # ✅ Node cap excess (NEW)
+    for (node, slot), flow in node_flow_map.items():
+        cap = node_caps.get(node, 1e12)  # unlimited default if missing
+        if flow > cap:
+            node_cap_excess += (flow - cap)
+
     penalty = (
         PEN_MISS_ALLOC * float(miss_alloc) +
         PEN_MISS_TT * float(miss_tt) +
-        PEN_CAP_EXCESS_PER_TEU * float(cap_excess)
+        PEN_CAP_EXCESS_PER_TEU * float(cap_excess) +
+        PEN_NODE_CAP_EXCESS_PER_TEU * float(node_cap_excess)
     )
 
     ind.objectives = (float(total_cost), float(total_emission_g), float(makespan))
     ind.penalty = float(penalty)
 
-    hard_ok = (miss_alloc == 0 and miss_tt == 0 and cap_excess <= 1e-9)
+    hard_ok = (miss_alloc == 0 and miss_tt == 0 and cap_excess <= 1e-9 and node_cap_excess <= 1e-9)
     strict_no_late = (late_h_total <= 1e-9)
 
     ind.feasible_hard = bool(hard_ok and strict_no_late)
@@ -706,6 +755,7 @@ def evaluate_individual(
         "miss_alloc": float(miss_alloc),
         "miss_tt": float(miss_tt),
         "cap_excess": float(cap_excess),
+        "node_cap_excess": float(node_cap_excess),  # ✅ NEW
         "late_h": float(late_h_total),
         "late_teu_h": float(late_teu_h_total),
         "wait_h": float(wait_h_total),
@@ -721,8 +771,6 @@ def clone_gene(alloc: PathAllocation) -> PathAllocation:
     return PathAllocation(path=alloc.path, share=float(alloc.share))
 
 
-# --- NOTE: This crossover_structural already matches Program B exactly.
-# It copies g2 to BOTH children if g1 is empty, and vice versa, and does per-batch cut/splice + merge_and_normalize.
 def crossover_structural(ind1: Individual, ind2: Individual, batches: List[Batch]) -> Tuple[Individual, Individual]:
     child1 = Individual()
     child2 = Individual()
@@ -759,7 +807,7 @@ def crossover_structural(ind1: Individual, ind2: Individual, batches: List[Batch
 
 # ========================
 # NEW: Program A crossover #2 (common-node segment crossover)
-#      + safe rebuild of arcs/base metrics to avoid "zero-cost empty-arcs" fake winners
+#      + safe rebuild of arcs/base metrics
 # ========================
 
 def path_from_arcs(new_arcs: List[Arc], origin: str, destination: str, path_id: int = -1) -> Optional[Path]:
@@ -796,13 +844,6 @@ def rebuild_path_from_nodes_modes(
     arc_lookup: Dict[Tuple[str, str, str], Arc],
     allow_road_fallback_if_no_timetable: bool = True,
 ) -> Optional[Path]:
-    """
-    Rebuild a Path object from (nodes, modes) with full Arc list + base metrics.
-    - Ensures nodes[0]=origin, nodes[-1]=destination
-    - Ensures len(modes)=len(nodes)-1
-    - Ensures no cycles (unique nodes)
-    - For non-road arcs: if timetable missing, optionally fallback to road if available (same spirit as path_lib repair)
-    """
     if not nodes or len(nodes) < 2:
         return None
     if nodes[0] != origin or nodes[-1] != destination:
@@ -822,7 +863,6 @@ def rebuild_path_from_nodes_modes(
 
         arc = arc_lookup[k]
 
-        # timetable feasibility repair: if non-road has no timetable -> fallback to road if enabled
         if arc.mode != "road":
             entries = tt_dict.get((u, v, arc.mode), [])
             if not entries:
@@ -837,9 +877,6 @@ def rebuild_path_from_nodes_modes(
 
 
 def find_common_internal_nodes(p1: Path, p2: Path) -> List[str]:
-    """
-    Common nodes excluding endpoints (internal nodes only).
-    """
     if not p1.nodes or not p2.nodes:
         return []
     s1 = set(p1.nodes[1:-1])
@@ -855,19 +892,12 @@ def perform_single_point_crossover_paths(
     tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
     arc_lookup: Dict[Tuple[str, str, str], Arc],
 ) -> Optional[Path]:
-    """
-    Path-segment crossover at a common node:
-      new_nodes = pA.prefix_to(join_node) + pB.suffix_from(join_node)
-      new_modes = pA.prefix_modes + pB.suffix_modes
-    Then rebuild arcs + base metrics safely.
-    """
     if join_node not in pA.nodes or join_node not in pB.nodes:
         return None
 
     ia = pA.nodes.index(join_node)
     ib = pB.nodes.index(join_node)
 
-    # prefix includes join_node, suffix excludes join_node (to avoid duplication)
     new_nodes = pA.nodes[:ia + 1] + pB.nodes[ib + 1:]
     new_modes = pA.modes[:ia] + pB.modes[ib:]
 
@@ -889,15 +919,6 @@ def crossover_common_node(
     tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
     arc_lookup: Dict[Tuple[str, str, str], Arc],
 ) -> Tuple[Individual, Individual]:
-    """
-    Program A crossover #2:
-    - For each batch gene:
-      - pick one path from each parent
-      - if they share an internal node, perform segment crossover at that node
-      - inject the new path into child allocations (then merge_and_normalize)
-    - Empty-gene handling matches Program B structural behavior:
-      - if one parent empty, copy the other to BOTH children
-    """
     child1 = Individual()
     child2 = Individual()
 
@@ -919,11 +940,9 @@ def crossover_common_node(
             child2.od_allocations[key] = [clone_gene(x) for x in g1]
             continue
 
-        # start from parents' genes (keeps diversity), then try injecting crossover-produced path
         c1_allocs = [clone_gene(x) for x in g1]
         c2_allocs = [clone_gene(x) for x in g2]
 
-        # select one path from each parent for crossover
         p1 = random.choice(g1).path
         p2 = random.choice(g2).path
 
@@ -934,7 +953,6 @@ def crossover_common_node(
             new_p_for_c1 = perform_single_point_crossover_paths(p1, p2, join, tt_dict, arc_lookup)
             new_p_for_c2 = perform_single_point_crossover_paths(p2, p1, join, tt_dict, arc_lookup)
 
-            # inject if succeeded
             if new_p_for_c1 is not None:
                 c1_allocs.append(PathAllocation(path=new_p_for_c1, share=0.20))
             if new_p_for_c2 is not None:
@@ -953,11 +971,6 @@ def crossover_hybrid(
     tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
     arc_lookup: Dict[Tuple[str, str, str], Arc],
 ) -> Tuple[Individual, Individual]:
-    """
-    Hybrid crossover selector:
-      - with prob CROSSOVER_SEGMENT_PROB: use common-node segment crossover
-      - else: use structural cut/splice crossover
-    """
     if random.random() < CROSSOVER_SEGMENT_PROB:
         c1, c2 = crossover_common_node(p1, p2, batches, tt_dict, arc_lookup)
         if not c1.od_allocations and not c2.od_allocations:
@@ -1153,7 +1166,8 @@ def mutate_roulette_adaptive(
     parent_snapshot: Individual,
     arcs: List[Arc],
     waiting_cost_per_teu_h: float,
-    wait_emis_g_per_teu_h: float
+    wait_emis_g_per_teu_h: float,
+    node_caps: Dict[str, float],  # ✅ NEW
 ) -> Tuple[str, bool, bool]:
     batch = random.choice(batches)
     op = roulette.sample()
@@ -1163,7 +1177,7 @@ def mutate_roulette_adaptive(
         return op, False, False
 
     repair_missing_allocations(ind, batches, path_lib)
-    evaluate_individual(ind, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
+    evaluate_individual(ind, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
 
     success = is_improved(parent_snapshot, ind)
     roulette.update(op, success=success)
@@ -1578,6 +1592,7 @@ def plot_violation_breakdown_stacked(gen, vio_mean_dict_mean, save="violation_br
     miss_alloc = np.array(vio_mean_dict_mean["miss_alloc"])
     miss_tt = np.array(vio_mean_dict_mean["miss_tt"])
     cap_excess = np.array(vio_mean_dict_mean["cap_excess"])
+    node_cap_excess = np.array(vio_mean_dict_mean["node_cap_excess"])  # ✅ NEW
     late_h = np.array(vio_mean_dict_mean["late_h"])
     wait_h = np.array(vio_mean_dict_mean["wait_h"])
 
@@ -1585,14 +1600,15 @@ def plot_violation_breakdown_stacked(gen, vio_mean_dict_mean, save="violation_br
     plt.bar(gen, miss_alloc, label="miss_alloc")
     plt.bar(gen, miss_tt, bottom=miss_alloc, label="miss_tt")
     plt.bar(gen, cap_excess, bottom=miss_alloc + miss_tt, label="cap_excess")
-    plt.bar(gen, late_h, bottom=miss_alloc + miss_tt + cap_excess, label="late_h")
-    plt.bar(gen, wait_h, bottom=miss_alloc + miss_tt + cap_excess + late_h, label="wait_h")
+    plt.bar(gen, node_cap_excess, bottom=miss_alloc + miss_tt + cap_excess, label="node_cap_excess")
+    plt.bar(gen, late_h, bottom=miss_alloc + miss_tt + cap_excess + node_cap_excess, label="late_h")
+    plt.bar(gen, wait_h, bottom=miss_alloc + miss_tt + cap_excess + node_cap_excess + late_h, label="wait_h")
 
     plt.xlabel("Generation")
     plt.ylabel("Mean Violation Components (stacked)")
     plt.title("Diagnostics Breakdown (mean over runs)")
     plt.grid(axis="y", linestyle="--", alpha=0.3)
-    plt.legend(ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.18))
+    plt.legend(ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.18))
     plt.tight_layout()
     plt.savefig(save)
     plt.close()
@@ -1668,7 +1684,7 @@ def plot_pareto_3d_all_generations(
 
 def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
     print("Loading data...")
-    node_names, arcs, timetables, batches, waiting_cost_per_teu_h, wait_emis_g_per_teu_h = load_network_from_extended(filename)
+    node_names, node_region, node_caps, arcs, timetables, batches, waiting_cost_per_teu_h, wait_emis_g_per_teu_h = load_network_from_extended(filename)
 
     tt_dict = build_timetable_dict(timetables)
     arc_lookup = build_arc_lookup(arcs)
@@ -1690,7 +1706,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
     for _ in range(pop_size):
         ind = random_initial_individual(batches, path_lib)
         repair_missing_allocations(ind, batches, path_lib)
-        evaluate_individual(ind, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
+        evaluate_individual(ind, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
         population.append(ind)
 
     all_objs = np.array([ind.objectives for ind in population], dtype=float)
@@ -1702,7 +1718,7 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
     hv_history: List[float] = []
     feasible_ratio_hist: List[float] = []
     feasible_ratio_strict_hist: List[float] = []
-    vio_mean_hist: Dict[str, List[float]] = {k: [] for k in ["miss_alloc", "miss_tt", "cap_excess", "late_h", "wait_h"]}
+    vio_mean_hist: Dict[str, List[float]] = {k: [] for k in ["miss_alloc", "miss_tt", "cap_excess", "node_cap_excess", "late_h", "wait_h"]}
 
     mut_tracker = {
         "attempt": {op: [0] * generations for op in OPS},
@@ -1762,7 +1778,6 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
             p1, p2 = random.sample(mating_pool, 2)
 
             if random.random() < CROSSOVER_RATE:
-                # ✅ NEW: both Program A crossovers included via hybrid
                 c1, c2 = crossover_hybrid(p1, p2, batches, tt_dict, arc_lookup)
             else:
                 c1 = random_initial_individual(batches, path_lib)
@@ -1770,15 +1785,16 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
 
             repair_missing_allocations(c1, batches, path_lib)
             repair_missing_allocations(c2, batches, path_lib)
-            evaluate_individual(c1, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
-            evaluate_individual(c2, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
+            evaluate_individual(c1, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
+            evaluate_individual(c2, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
 
             if random.random() < MUTATION_RATE:
                 snap = deepcopy(c1)
                 op, ok, suc = mutate_roulette_adaptive(
                     c1, batches, path_lib, tt_dict, arc_lookup,
                     roulette, snap, arcs,
-                    waiting_cost_per_teu_h, wait_emis_g_per_teu_h
+                    waiting_cost_per_teu_h, wait_emis_g_per_teu_h,
+                    node_caps
                 )
                 mut_tracker["attempt"][op][gen] += 1
                 mut_tracker["success"][op][gen] += (1 if suc else 0)
@@ -1788,15 +1804,16 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
                 op, ok, suc = mutate_roulette_adaptive(
                     c2, batches, path_lib, tt_dict, arc_lookup,
                     roulette, snap, arcs,
-                    waiting_cost_per_teu_h, wait_emis_g_per_teu_h
+                    waiting_cost_per_teu_h, wait_emis_g_per_teu_h,
+                    node_caps
                 )
                 mut_tracker["attempt"][op][gen] += 1
                 mut_tracker["success"][op][gen] += (1 if suc else 0)
 
             repair_missing_allocations(c1, batches, path_lib)
             repair_missing_allocations(c2, batches, path_lib)
-            evaluate_individual(c1, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
-            evaluate_individual(c2, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h)
+            evaluate_individual(c1, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
+            evaluate_individual(c2, batches, arcs, tt_dict, waiting_cost_per_teu_h, wait_emis_g_per_teu_h, node_caps)
 
             offspring.append(c1)
             offspring.append(c2)
@@ -1851,7 +1868,7 @@ def save_pareto_solutions(pareto: List[Individual], batches: List[Batch], filena
         f.write("===== NSGA-II Pareto Solutions (Feasible Only) =====\n\n")
         if not pareto:
             f.write("NO FEASIBLE SOLUTION FOUND.\n")
-            f.write("Check: path_lib coverage, timetable coverage, capacity scale, or HARD_TIME_WINDOW.\n")
+            f.write("Check: path_lib coverage, timetable coverage, capacity scale, node capacity, or HARD_TIME_WINDOW.\n")
             print(f"Saved 0 feasible Pareto solutions to {filename}")
             return
 
@@ -1882,21 +1899,6 @@ import json
 from pathlib import Path as FSPath
 
 def export_pareto_points_json(pareto: List[Individual], batches: List[Batch], out_json: str):
-    """
-    Save Pareto solutions to a JSON file.
-    Schema (per solution):
-      {
-        "objectives": {"cost":..., "emission":..., "makespan":..., "penalty":...},
-        "feasible_soft": bool,
-        "feasible_strict": bool,
-        "vio_breakdown": {...},
-        "allocations": [
-           {"batch_id":..., "origin":..., "destination":..., "paths":[
-               {"share":..., "nodes":[...], "modes":[...]}
-           ]}
-        ]
-      }
-    """
     FSPath(FSPath(out_json).parent).mkdir(parents=True, exist_ok=True)
 
     out = []
@@ -1967,6 +1969,8 @@ if __name__ == "__main__":
     print(f"[CONFIG] Waiting in objectives: cost_per_teu_h default={WAITING_COST_PER_TEU_HOUR_DEFAULT}, "
           f"emis_g_per_teu_h default={WAIT_EMISSION_gCO2_per_TEU_H_DEFAULT}")
     print(f"[CONFIG] Lateness in cost: LATE_COST_PER_TEU_HOUR={LATE_COST_PER_TEU_HOUR:.3e}")
+    print(f"[CONFIG] Penalties: MISS_ALLOC={PEN_MISS_ALLOC:.2e}, MISS_TT={PEN_MISS_TT:.2e}, "
+          f"ARC_CAP={PEN_CAP_EXCESS_PER_TEU:.2e}, NODE_CAP={PEN_NODE_CAP_EXCESS_PER_TEU:.2e}")
     print(f"[CONFIG] Path lib: topK per criterion={PATHS_TOPK_PER_CRITERION}, "
           f"cap_total={PATH_LIB_CAP_TOTAL}, dfs_pool={DFS_MAX_PATHS_PER_OD}")
 
@@ -2037,7 +2041,7 @@ if __name__ == "__main__":
     print("Saved Excel:", excel_name)
 
     # ========================
-    # FAST P* (key optimisation)
+    # FAST P*
     # ========================
     t_ps = time.perf_counter()
     P_star = build_P_star_fast(run_front_hist,
@@ -2097,7 +2101,7 @@ if __name__ == "__main__":
     print("[DEBUG] fr_mean  min/max:", float(np.min(fr_mean)), float(np.max(fr_mean)), " anyNaN=", bool(np.isnan(fr_mean).any()))
     print("[DEBUG] frs_mean min/max:", float(np.min(frs_mean)), float(np.max(frs_mean)), " anyNaN=", bool(np.isnan(frs_mean).any()))
 
-    vio_keys = ["miss_alloc", "miss_tt", "cap_excess", "late_h", "wait_h"]
+    vio_keys = ["miss_alloc", "miss_tt", "cap_excess", "node_cap_excess", "late_h", "wait_h"]
     vio_mean_dict_mean = {k: [0.0] * generations for k in vio_keys}
     for k in vio_keys:
         mat = np.array([run_vio_mean[r][k] for r in range(runs)], dtype=float)
@@ -2130,9 +2134,7 @@ if __name__ == "__main__":
         for i, ind in enumerate(best_pareto[:3]):
             print_pure_structure(ind, best_batches, f"BestRun Pareto Sol {i}")
 
-        # human-readable
         save_pareto_solutions(best_pareto, best_batches, filename="result.txt")
-        # machine-readable for compare scripts
         export_pareto_points_json(best_pareto, best_batches, out_json="nsga_pareto_points.json")
 
     best_final_points = []
