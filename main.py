@@ -1,48 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-NSGA-II (Batch-level encoding) with:
-- Scheme A: Lateness and waiting are incorporated into objectives (NOT penalty).
-  * Cost = transport_cost + waiting_cost + lateness_cost
-  * Emission = transport_emission + waiting_emission
-  * Makespan = max completion time
-- Penalty is reserved for HARD constraints only:
-  * missing allocation (miss_alloc)
-  * missing timetable (miss_tt)
-  * capacity excess (cap_excess)
-- Constraint-domination:
-  * feasible dominates infeasible
-  * feasible compares by Pareto on objectives
-  * infeasible compares by penalty first then Pareto
-- Multi-runs analytics:
-  * HV, IGD+ (with pseudo-reference P*), Spacing,
-  * feasible ratio (soft feasible) + strict feasible ratio (no lateness),
-  * mutation roulette plots
-  * Pareto 3D plots (final + all generations for best run)
-  * runtime summary Excel
-
-✅ SPEED + ACCURACY PATCHES:
-1) P* uses “tail gens + per-gen cap + total cap”
-2) HV computed every HV_EVERY gens + Monte Carlo HV_SAMPLES
-3) IGD+/Spacing computed every METRIC_EVERY gens
-4) All plotting functions do savefig then plt.close() to avoid memory creep
-
-✅ YOUR REQUESTED PATCHES:
-(A) Make Program B parameters consistent with Program A:
-    - Adaptive roulette EMA alpha: 0.35 (was 0.10)
-    - Use named constants for crossover/mutation rates
-(B) Add JSON export for Pareto solutions (avoid Path name clash by using FSPath alias)
-    - export_pareto_points_json(...)
-    - call it at the end: nsga_pareto_points.json
-
-✅ YOUR NEW REQUEST (this edit):
-- Make Program A "crossover operator part" match Program B exactly.
-- Make Program A "timetable departure selection logic" match Program B exactly for the evaluated capacity/timetable simulation:
-  Program B uses ONLY entries[0] (not min over all entries).
-  (Everything else remains unchanged.)
-"""
-
 import math
 import random
 import time
@@ -100,6 +58,9 @@ MUTATION_RATE = 0.25          # per-child mutation chance
 PATHS_TOPK_PER_CRITERION = 30
 PATH_LIB_CAP_TOTAL = 90
 DFS_MAX_PATHS_PER_OD = 1200
+
+# ---- NEW: Use both crossovers from Program A (structural + segment/common-node)
+CROSSOVER_SEGMENT_PROB = 0.50  # within crossover trigger, 50% segment, 50% structural
 
 
 # ========================
@@ -796,6 +757,215 @@ def crossover_structural(ind1: Individual, ind2: Individual, batches: List[Batch
     return child1, child2
 
 
+# ========================
+# NEW: Program A crossover #2 (common-node segment crossover)
+#      + safe rebuild of arcs/base metrics to avoid "zero-cost empty-arcs" fake winners
+# ========================
+
+def path_from_arcs(new_arcs: List[Arc], origin: str, destination: str, path_id: int = -1) -> Optional[Path]:
+    if not new_arcs:
+        return None
+    nodes = [new_arcs[0].from_node] + [a.to_node for a in new_arcs]
+    if nodes[0] != origin or nodes[-1] != destination:
+        return None
+    if len(set(nodes)) != len(nodes):
+        return None
+    modes = [a.mode for a in new_arcs]
+    base_cost = sum(a.cost_per_teu_km * a.distance for a in new_arcs)
+    base_emis = sum(a.emission_per_teu_km * a.distance for a in new_arcs)
+    base_time = sum(a.distance / max(a.speed_kmh, 1.0) for a in new_arcs)
+    return Path(
+        path_id=path_id,
+        origin=origin,
+        destination=destination,
+        nodes=nodes,
+        modes=modes,
+        arcs=new_arcs,
+        base_cost_per_teu=base_cost,
+        base_emission_per_teu=base_emis,
+        base_travel_time_h=base_time
+    )
+
+
+def rebuild_path_from_nodes_modes(
+    origin: str,
+    destination: str,
+    nodes: List[str],
+    modes: List[str],
+    tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
+    arc_lookup: Dict[Tuple[str, str, str], Arc],
+    allow_road_fallback_if_no_timetable: bool = True,
+) -> Optional[Path]:
+    """
+    Rebuild a Path object from (nodes, modes) with full Arc list + base metrics.
+    - Ensures nodes[0]=origin, nodes[-1]=destination
+    - Ensures len(modes)=len(nodes)-1
+    - Ensures no cycles (unique nodes)
+    - For non-road arcs: if timetable missing, optionally fallback to road if available (same spirit as path_lib repair)
+    """
+    if not nodes or len(nodes) < 2:
+        return None
+    if nodes[0] != origin or nodes[-1] != destination:
+        return None
+    if len(modes) != len(nodes) - 1:
+        return None
+    if len(set(nodes)) != len(nodes):
+        return None
+
+    new_arcs: List[Arc] = []
+    for i in range(len(modes)):
+        u, v, m = nodes[i], nodes[i + 1], modes[i]
+        k = (u, v, m)
+
+        if k not in arc_lookup:
+            return None
+
+        arc = arc_lookup[k]
+
+        # timetable feasibility repair: if non-road has no timetable -> fallback to road if enabled
+        if arc.mode != "road":
+            entries = tt_dict.get((u, v, arc.mode), [])
+            if not entries:
+                if allow_road_fallback_if_no_timetable and (u, v, "road") in arc_lookup:
+                    arc = arc_lookup[(u, v, "road")]
+                else:
+                    return None
+
+        new_arcs.append(arc)
+
+    return path_from_arcs(new_arcs, origin, destination, path_id=-1)
+
+
+def find_common_internal_nodes(p1: Path, p2: Path) -> List[str]:
+    """
+    Common nodes excluding endpoints (internal nodes only).
+    """
+    if not p1.nodes or not p2.nodes:
+        return []
+    s1 = set(p1.nodes[1:-1])
+    s2 = set(p2.nodes[1:-1])
+    common = list(s1.intersection(s2))
+    return common
+
+
+def perform_single_point_crossover_paths(
+    pA: Path,
+    pB: Path,
+    join_node: str,
+    tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
+    arc_lookup: Dict[Tuple[str, str, str], Arc],
+) -> Optional[Path]:
+    """
+    Path-segment crossover at a common node:
+      new_nodes = pA.prefix_to(join_node) + pB.suffix_from(join_node)
+      new_modes = pA.prefix_modes + pB.suffix_modes
+    Then rebuild arcs + base metrics safely.
+    """
+    if join_node not in pA.nodes or join_node not in pB.nodes:
+        return None
+
+    ia = pA.nodes.index(join_node)
+    ib = pB.nodes.index(join_node)
+
+    # prefix includes join_node, suffix excludes join_node (to avoid duplication)
+    new_nodes = pA.nodes[:ia + 1] + pB.nodes[ib + 1:]
+    new_modes = pA.modes[:ia] + pB.modes[ib:]
+
+    return rebuild_path_from_nodes_modes(
+        origin=pA.origin,
+        destination=pA.destination,
+        nodes=new_nodes,
+        modes=new_modes,
+        tt_dict=tt_dict,
+        arc_lookup=arc_lookup,
+        allow_road_fallback_if_no_timetable=True,
+    )
+
+
+def crossover_common_node(
+    ind1: Individual,
+    ind2: Individual,
+    batches: List[Batch],
+    tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
+    arc_lookup: Dict[Tuple[str, str, str], Arc],
+) -> Tuple[Individual, Individual]:
+    """
+    Program A crossover #2:
+    - For each batch gene:
+      - pick one path from each parent
+      - if they share an internal node, perform segment crossover at that node
+      - inject the new path into child allocations (then merge_and_normalize)
+    - Empty-gene handling matches Program B structural behavior:
+      - if one parent empty, copy the other to BOTH children
+    """
+    child1 = Individual()
+    child2 = Individual()
+
+    for b in batches:
+        key = (b.origin, b.destination, b.batch_id)
+        g1 = ind1.od_allocations.get(key, [])
+        g2 = ind2.od_allocations.get(key, [])
+
+        if not g1 and not g2:
+            continue
+
+        if not g1:
+            child1.od_allocations[key] = [clone_gene(x) for x in g2]
+            child2.od_allocations[key] = [clone_gene(x) for x in g2]
+            continue
+
+        if not g2:
+            child1.od_allocations[key] = [clone_gene(x) for x in g1]
+            child2.od_allocations[key] = [clone_gene(x) for x in g1]
+            continue
+
+        # start from parents' genes (keeps diversity), then try injecting crossover-produced path
+        c1_allocs = [clone_gene(x) for x in g1]
+        c2_allocs = [clone_gene(x) for x in g2]
+
+        # select one path from each parent for crossover
+        p1 = random.choice(g1).path
+        p2 = random.choice(g2).path
+
+        common = find_common_internal_nodes(p1, p2)
+        if common:
+            join = random.choice(common)
+
+            new_p_for_c1 = perform_single_point_crossover_paths(p1, p2, join, tt_dict, arc_lookup)
+            new_p_for_c2 = perform_single_point_crossover_paths(p2, p1, join, tt_dict, arc_lookup)
+
+            # inject if succeeded
+            if new_p_for_c1 is not None:
+                c1_allocs.append(PathAllocation(path=new_p_for_c1, share=0.20))
+            if new_p_for_c2 is not None:
+                c2_allocs.append(PathAllocation(path=new_p_for_c2, share=0.20))
+
+        child1.od_allocations[key] = merge_and_normalize(c1_allocs)
+        child2.od_allocations[key] = merge_and_normalize(c2_allocs)
+
+    return child1, child2
+
+
+def crossover_hybrid(
+    p1: Individual,
+    p2: Individual,
+    batches: List[Batch],
+    tt_dict: Dict[Tuple[str, str, str], List[TimetableEntry]],
+    arc_lookup: Dict[Tuple[str, str, str], Arc],
+) -> Tuple[Individual, Individual]:
+    """
+    Hybrid crossover selector:
+      - with prob CROSSOVER_SEGMENT_PROB: use common-node segment crossover
+      - else: use structural cut/splice crossover
+    """
+    if random.random() < CROSSOVER_SEGMENT_PROB:
+        c1, c2 = crossover_common_node(p1, p2, batches, tt_dict, arc_lookup)
+        if not c1.od_allocations and not c2.od_allocations:
+            return crossover_structural(p1, p2, batches)
+        return c1, c2
+    return crossover_structural(p1, p2, batches)
+
+
 def random_initial_individual(batches: List[Batch], path_lib: Dict[Tuple[str, str], List[Path]], max_paths=3) -> Individual:
     ind = Individual()
     for b in batches:
@@ -853,31 +1023,6 @@ def mutate_mod(ind: Individual, batch: Batch):
     target.share *= random.uniform(0.5, 1.5)
     ind.od_allocations[key] = merge_and_normalize(allocs)
     return True
-
-
-def path_from_arcs(new_arcs: List[Arc], origin: str, destination: str, path_id: int = -1) -> Optional[Path]:
-    if not new_arcs:
-        return None
-    nodes = [new_arcs[0].from_node] + [a.to_node for a in new_arcs]
-    if nodes[0] != origin or nodes[-1] != destination:
-        return None
-    if len(set(nodes)) != len(nodes):
-        return None
-    modes = [a.mode for a in new_arcs]
-    base_cost = sum(a.cost_per_teu_km * a.distance for a in new_arcs)
-    base_emis = sum(a.emission_per_teu_km * a.distance for a in new_arcs)
-    base_time = sum(a.distance / max(a.speed_kmh, 1.0) for a in new_arcs)
-    return Path(
-        path_id=path_id,
-        origin=origin,
-        destination=destination,
-        nodes=nodes,
-        modes=modes,
-        arcs=new_arcs,
-        base_cost_per_teu=base_cost,
-        base_emission_per_teu=base_emis,
-        base_travel_time_h=base_time
-    )
 
 
 def mutate_mode(ind: Individual, batch: Batch, tt_dict, arc_lookup, max_trials: int = 20):
@@ -1617,7 +1762,8 @@ def run_nsga2_analytics(filename="data.xlsx", pop_size=60, generations=200):
             p1, p2 = random.sample(mating_pool, 2)
 
             if random.random() < CROSSOVER_RATE:
-                c1, c2 = crossover_structural(p1, p2, batches)
+                # ✅ NEW: both Program A crossovers included via hybrid
+                c1, c2 = crossover_hybrid(p1, p2, batches, tt_dict, arc_lookup)
             else:
                 c1 = random_initial_individual(batches, path_lib)
                 c2 = random_initial_individual(batches, path_lib)
@@ -1826,6 +1972,7 @@ if __name__ == "__main__":
 
     print(f"[CONFIG] Adaptive roulette: EMA_ALPHA={ROULETTE_EMA_ALPHA}, MIN_PROB={ROULETTE_MIN_PROB}, SCORE_EPS={ROULETTE_SCORE_EPS}")
     print(f"[CONFIG] GA rates: CROSSOVER_RATE={CROSSOVER_RATE}, MUTATION_RATE={MUTATION_RATE}")
+    print(f"[CONFIG] Crossovers: structural + common-node segment (segment_prob={CROSSOVER_SEGMENT_PROB})")
 
     print(f"[CONFIG] HV_EVERY={HV_EVERY}, HV_SAMPLES={HV_SAMPLES}, METRIC_EVERY={METRIC_EVERY}")
     print(f"[CONFIG] P*: tail_gens={PSTAR_TAIL_GENS}, cap_per_gen={PSTAR_CAP_PER_GEN}, max_total={PSTAR_MAX_TOTAL}")
